@@ -101,7 +101,31 @@
         </div>
       </details>
 
+      <!-- preview: watch and listen before committing to a transcription -->
+      <section class="preview" id="preview-panel" hidden>
+        <div class="preview-head">
+          <h2>Preview</h2>
+          <span class="preview-status" id="preview-status"></span>
+          <div class="spacer"></div>
+          <button class="ghost" id="preview-close" type="button" aria-label="Close preview">✕</button>
+        </div>
+        <video id="preview-video" controls preload="metadata" playsinline></video>
+        <div class="waveform-wrap">
+          <canvas id="waveform" height="80" aria-label="Audio waveform — drag to narrow the range"></canvas>
+          <p class="waveform-hint" id="waveform-hint">
+            Drag across the waveform to narrow the range. Click to seek.
+          </p>
+        </div>
+        <div class="preview-actions">
+          <span class="preview-range" id="preview-range"></span>
+          <div class="spacer"></div>
+          <button class="ghost" id="preview-reset" type="button" hidden>Clear trim</button>
+          <button class="primary" id="preview-transcribe" type="button">Transcribe this</button>
+        </div>
+      </section>
+
       <div class="actions">
+        <button class="ghost" id="preview-job" type="button" disabled>Preview</button>
         <button class="primary" id="submit-job" type="button" disabled>Transcribe selection</button>
         <label class="upload-btn">
           Upload a clip instead

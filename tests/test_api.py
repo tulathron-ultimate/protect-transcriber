@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -97,13 +96,6 @@ class FakePool:
 
     async def aclose(self):
         return None
-
-
-@pytest.fixture
-def clip_bytes(tmp_path, make_media) -> bytes:
-    """A 12-second mp4 with an audio track, produced by ffmpeg."""
-    path = make_media(tmp_path / "source.mp4", seconds=12, with_audio=True, video=True)
-    return path.read_bytes()
 
 
 def build_client(tmp_path, *, protect=None, pool=None, **overrides):

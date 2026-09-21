@@ -145,6 +145,14 @@ class Settings(BaseSettings):
     # usually right; raise it if you have several idle instances.
     max_concurrent_jobs: int = 1
 
+    # --- Preview -----------------------------------------------------------
+    # A preview exports the selected range so you can watch/listen to it and see
+    # its waveform before committing to a transcription. Capped because the
+    # export is the slow part and a preview is meant to feel immediate.
+    preview_max_seconds: int = 900
+    preview_retention_hours: int = 24
+    waveform_buckets: int = 900
+
     # --- Chunking ----------------------------------------------------------
     # Whisper degrades and containers time out on very long audio, so clips are
     # split. Boundaries are snapped to silence where possible (see app/media.py).
@@ -196,6 +204,10 @@ class Settings(BaseSettings):
         return _parse_instances(self.whisper_instances)
 
     @property
+    def previews_dir(self) -> Path:
+        return self.data_dir / "previews"
+
+    @property
     def clips_dir(self) -> Path:
         return self.data_dir / "clips"
 
@@ -212,7 +224,13 @@ class Settings(BaseSettings):
         return self.data_dir / "protect-transcriber.db"
 
     def ensure_dirs(self) -> None:
-        for path in (self.data_dir, self.clips_dir, self.audio_dir, self.transcripts_dir):
+        for path in (
+            self.data_dir,
+            self.clips_dir,
+            self.audio_dir,
+            self.transcripts_dir,
+            self.previews_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
     def configured(self) -> bool:

@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import shutil
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,14 +124,30 @@ async def inspect(path: Path, ffprobe: str = "ffprobe") -> MediaInfo:
 
 
 async def extract_audio(
-    source: Path, destination: Path, *, ffmpeg: str = "ffmpeg", sample_rate: int = 16000
+    source: Path,
+    destination: Path,
+    *,
+    ffmpeg: str = "ffmpeg",
+    sample_rate: int = 16000,
+    start: float | None = None,
+    duration: float | None = None,
 ) -> Path:
     """Decode the audio track to mono 16 kHz PCM WAV -- what Whisper wants anyway.
 
     Doing the resample here rather than inside each Whisper container saves the
     pool a decode step and keeps chunk boundaries exact.
+
+    ``start``/``duration`` trim while decoding, which is how a job built from a
+    preview narrows to a sub-range: the clip is already on disk, so only the
+    audio needs cutting and no re-export is involved. Seeking happens after
+    ``-i`` so it is frame-accurate rather than snapping to a keyframe.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
+    trim: list[str] = []
+    if start:
+        trim += ["-ss", f"{max(0.0, start):.3f}"]
+    if duration:
+        trim += ["-t", f"{max(0.0, duration):.3f}"]
     code, _, stderr = await _run(
         [
             ffmpeg,
@@ -141,6 +158,7 @@ async def extract_audio(
             "-y",
             "-i",
             str(source),
+            *trim,
             "-vn",
             "-map",
             "0:a:0",
@@ -316,3 +334,50 @@ async def split_audio(
     if not chunks:
         raise MediaError(f"Splitting {path.name} produced no chunks")
     return chunks
+
+
+def _peaks_from_wav(path: Path, buckets: int) -> list[float]:
+    """Peak amplitude per bucket, 0..1, read straight from a 16-bit mono WAV.
+
+    Pure stdlib on purpose: ``audioop`` was removed in Python 3.13, and pulling
+    in numpy for one envelope would be a heavy dependency for a container that
+    otherwise only needs ffmpeg.
+    """
+    import wave
+
+    peaks: list[float] = []
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if handle.getsampwidth() != 2:
+                raise MediaError(
+                    f"Expected 16-bit audio for the waveform, got {handle.getsampwidth() * 8}-bit"
+                )
+            total = handle.getnframes()
+            channels = max(1, handle.getnchannels())
+            if total <= 0:
+                return []
+            buckets = max(1, min(buckets, total))
+            frames_per_bucket = max(1, total // buckets)
+
+            while len(peaks) < buckets:
+                raw = handle.readframes(frames_per_bucket)
+                if not raw:
+                    break
+                samples = array("h", raw[: len(raw) - (len(raw) % 2)])
+                if channels > 1:
+                    samples = samples[::channels]
+                if not samples:
+                    continue
+                # 32768 is int16's negative bound, so this normalises to 0..1.
+                loudest = max(abs(min(samples)), abs(max(samples)))
+                peaks.append(min(1.0, loudest / 32768.0))
+    except (wave.Error, EOFError) as exc:
+        # Anything that is not plain PCM (float, extensible, truncated) lands here.
+        raise MediaError(f"Cannot read 16-bit PCM from {path.name}: {exc}") from exc
+
+    return peaks
+
+
+async def waveform_peaks(path: Path, buckets: int = 900) -> list[float]:
+    """Envelope of ``path`` as ``buckets`` values in 0..1, computed off the loop."""
+    return await asyncio.to_thread(_peaks_from_wav, path, buckets)

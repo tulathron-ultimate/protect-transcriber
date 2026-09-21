@@ -60,3 +60,11 @@ def make_media():
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+def clip_bytes(tmp_path, make_media) -> bytes:
+    """A 12-second mp4 with an audio track, produced by ffmpeg."""
+    return _make_media(
+        tmp_path / "source.mp4", seconds=12, with_audio=True, video=True
+    ).read_bytes()

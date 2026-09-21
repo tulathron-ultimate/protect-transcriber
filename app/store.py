@@ -50,11 +50,35 @@ CREATE TABLE IF NOT EXISTS jobs (
     instances       TEXT NOT NULL DEFAULT '[]',
     error           TEXT,
     started_at      TEXT,
-    finished_at     TEXT
+    finished_at     TEXT,
+    preview_id      TEXT,
+    clip_offset     REAL NOT NULL DEFAULT 0,
+    clip_duration   REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+CREATE TABLE IF NOT EXISTS previews (
+    id           TEXT PRIMARY KEY,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'queued',
+    camera_id    TEXT NOT NULL DEFAULT '',
+    camera_name  TEXT NOT NULL DEFAULT '',
+    range_start  TEXT,
+    range_end    TEXT,
+    clip_path    TEXT,
+    audio_path   TEXT,
+    clip_bytes   INTEGER NOT NULL DEFAULT 0,
+    duration     REAL NOT NULL DEFAULT 0,
+    has_audio    INTEGER NOT NULL DEFAULT 0,
+    peaks        TEXT NOT NULL DEFAULT '[]',
+    error        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_previews_range
+    ON previews(camera_id, range_start, range_end);
 
 CREATE TABLE IF NOT EXISTS whisper_instances (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -410,3 +434,122 @@ class InstanceStore:
         """Insert ``rows`` only when the table is empty. Returns how many landed."""
         async with self._lock:
             return await asyncio.to_thread(self._seed_sync, rows)
+
+
+class PreviewStore:
+    """Exported clips kept around so a range can be watched before transcribing.
+
+    A preview is deliberately cheap to re-request: the same camera and range
+    returns the existing row when its files are still on disk, so nudging the
+    selection and previewing again does not re-export what is already there.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = asyncio.Lock()
+
+    def _create_sync(self, values: dict[str, Any]) -> dict[str, Any]:
+        now = _now()
+        values = dict(values)
+        values.setdefault("created_at", now)
+        values.setdefault("updated_at", now)
+        columns = ", ".join(values)
+        placeholders = ", ".join(f":{key}" for key in values)
+        with _connect(self._path) as conn:
+            conn.execute(f"INSERT INTO previews ({columns}) VALUES ({placeholders})", values)
+            row = conn.execute("SELECT * FROM previews WHERE id = ?", (values["id"],)).fetchone()
+        return _preview_row(row)
+
+    async def create(self, **values: Any) -> dict[str, Any]:
+        async with self._lock:
+            return await asyncio.to_thread(self._create_sync, values)
+
+    def _update_sync(self, preview_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+        payload = dict(fields)
+        if "peaks" in payload and not isinstance(payload["peaks"], str):
+            payload["peaks"] = json.dumps([round(float(p), 4) for p in payload["peaks"]])
+        payload["updated_at"] = _now()
+        assignments = ", ".join(f"{key} = :{key}" for key in payload)
+        payload["id"] = preview_id
+        with _connect(self._path) as conn:
+            conn.execute(f"UPDATE previews SET {assignments} WHERE id = :id", payload)
+            row = conn.execute("SELECT * FROM previews WHERE id = ?", (preview_id,)).fetchone()
+        return _preview_row(row) if row else None
+
+    async def update(self, preview_id: str, **fields: Any) -> dict[str, Any] | None:
+        async with self._lock:
+            return await asyncio.to_thread(self._update_sync, preview_id, fields)
+
+    def _get_sync(self, preview_id: str) -> dict[str, Any] | None:
+        with _connect(self._path) as conn:
+            row = conn.execute("SELECT * FROM previews WHERE id = ?", (preview_id,)).fetchone()
+        return _preview_row(row) if row else None
+
+    async def get(self, preview_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_sync, preview_id)
+
+    def _find_sync(self, camera_id: str, start: str, end: str) -> dict[str, Any] | None:
+        with _connect(self._path) as conn:
+            row = conn.execute(
+                "SELECT * FROM previews WHERE camera_id = ? AND range_start = ? "
+                "AND range_end = ? AND status = 'ready' ORDER BY created_at DESC LIMIT 1",
+                (camera_id, start, end),
+            ).fetchone()
+        return _preview_row(row) if row else None
+
+    async def find_ready(self, camera_id: str, start: str, end: str) -> dict[str, Any] | None:
+        """An existing ready preview for exactly this range, if its clip survives."""
+        row = await asyncio.to_thread(self._find_sync, camera_id, start, end)
+        if row is None:
+            return None
+        clip = row.get("clip_path")
+        if not clip or not Path(clip).exists():
+            return None
+        return row
+
+    def _delete_sync(self, preview_id: str) -> dict[str, Any] | None:
+        with _connect(self._path) as conn:
+            row = conn.execute("SELECT * FROM previews WHERE id = ?", (preview_id,)).fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM previews WHERE id = ?", (preview_id,))
+        return _preview_row(row)
+
+    async def delete(self, preview_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            return await asyncio.to_thread(self._delete_sync, preview_id)
+
+    def _expired_sync(self, cutoff: str, keep_ids: set[str]) -> list[dict[str, Any]]:
+        with _connect(self._path) as conn:
+            rows = conn.execute("SELECT * FROM previews WHERE created_at < ?", (cutoff,)).fetchall()
+        return [_preview_row(row) for row in rows if row["id"] not in keep_ids]
+
+    async def expired(self, retention_hours: int, keep_ids: set[str]) -> list[dict[str, Any]]:
+        """Old previews, excluding any whose clip a job still depends on."""
+        if retention_hours <= 0:
+            return []
+        cutoff = datetime.now(tz=UTC) - timedelta(hours=retention_hours)
+        return await asyncio.to_thread(
+            self._expired_sync, cutoff.isoformat(timespec="seconds"), keep_ids
+        )
+
+    def _referenced_sync(self) -> set[str]:
+        with _connect(self._path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT preview_id FROM jobs WHERE preview_id IS NOT NULL "
+                "AND status NOT IN ('failed', 'canceled')"
+            ).fetchall()
+        return {row["preview_id"] for row in rows if row["preview_id"]}
+
+    async def referenced_by_jobs(self) -> set[str]:
+        """Preview ids whose clip a surviving job is still using for playback."""
+        return await asyncio.to_thread(self._referenced_sync)
+
+
+def _preview_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    try:
+        data["peaks"] = json.loads(data.get("peaks") or "[]")
+    except (TypeError, ValueError):
+        data["peaks"] = []
+    return data

@@ -29,7 +29,7 @@ from . import media
 from . import transcript as tx
 from .config import Settings
 from .protect import ProtectClient, ProtectError
-from .store import JobStore
+from .store import JobStore, PreviewStore
 from .whisper import WhisperError, WhisperPool
 
 log = logging.getLogger(__name__)
@@ -82,15 +82,18 @@ class JobManager:
         store: JobStore,
         pool: WhisperPool,
         protect: ProtectClient,
+        previews: PreviewStore | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
+        self.previews = previews or PreviewStore(settings.db_path)
         self.pool = pool
         self.protect = protect
         self.events = EventBus()
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: list[asyncio.Task[None]] = []
         self._running: dict[str, asyncio.Task[None]] = {}
+        self._previews: dict[str, asyncio.Task[None]] = {}
         self._canceled: set[str] = set()
 
     # -- lifecycle ----------------------------------------------------------
@@ -104,11 +107,13 @@ class JobManager:
         log.info("Job manager started with %d worker(s)", count)
 
     async def stop(self) -> None:
-        for task in [*self._workers, *self._running.values()]:
+        tasks = [*self._workers, *self._running.values(), *self._previews.values()]
+        for task in tasks:
             task.cancel()
-        await asyncio.gather(*self._workers, *self._running.values(), return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
         self._workers.clear()
         self._running.clear()
+        self._previews.clear()
 
     async def _worker(self, index: int) -> None:
         while True:
@@ -145,6 +150,10 @@ class JobManager:
         prompt: str | None = None,
         source: str = "protect",
         upload_path: Path | None = None,
+        preview_id: str | None = None,
+        clip_path: Path | None = None,
+        clip_offset: float = 0.0,
+        clip_duration: float | None = None,
     ) -> dict[str, Any]:
         job_id = uuid.uuid4().hex[:12]
         record = await self.store.create(
@@ -161,7 +170,10 @@ class JobManager:
                 "language": language,
                 "task": task,
                 "prompt": prompt,
-                "clip_path": str(upload_path) if upload_path else None,
+                "clip_path": str(upload_path or clip_path) if (upload_path or clip_path) else None,
+                "preview_id": preview_id,
+                "clip_offset": clip_offset,
+                "clip_duration": clip_duration,
             }
         )
         self.events.publish({"type": "job.created", "job": record})
@@ -187,10 +199,12 @@ class JobManager:
             return None
         start = _parse_dt(record["range_start"])
         end = _parse_dt(record["range_end"])
-        if record["source"] == "upload":
+        if record["source"] in ("upload", "preview"):
             clip = record.get("clip_path")
             if not clip or not Path(clip).exists():
-                raise ProtectError("The uploaded file for this job is gone; upload it again.")
+                raise ProtectError(
+                    f"The {record['source']} clip for this job is gone; make the selection again."
+                )
         elif not (start and end and record["camera_id"]):
             raise ProtectError("This job has no camera/time range to re-export.")
         return await self.submit(
@@ -204,6 +218,10 @@ class JobManager:
             prompt=record["prompt"],
             source=record["source"],
             upload_path=Path(record["clip_path"]) if record["source"] == "upload" else None,
+            preview_id=record["preview_id"],
+            clip_path=Path(record["clip_path"]) if record["source"] == "preview" else None,
+            clip_offset=record["clip_offset"],
+            clip_duration=record["clip_duration"],
         )
 
     async def purge(self, job_id: str) -> bool:
@@ -245,11 +263,13 @@ class JobManager:
                 job_id, status="exporting", stage="exporting", started_at=_now_iso(), error=None
             )
 
-            # 1. get a clip -- either exported from Protect or already uploaded
-            if record["source"] == "upload":
-                clip_path = Path(record["clip_path"])
+            # 1. get a clip -- uploaded, already exported for a preview, or fetched now
+            if record["source"] in ("upload", "preview"):
+                clip_path = Path(record["clip_path"] or "")
                 if not clip_path.exists():
-                    raise ProtectError(f"Uploaded file {clip_path.name} is missing")
+                    raise ProtectError(
+                        f"The {record['source']} clip is no longer on disk; re-run the selection."
+                    )
             else:
                 clip_path = await self._export(job_id, record)
 
@@ -260,7 +280,15 @@ class JobManager:
             # 2. audio
             await self._set(job_id, status="extracting", stage="extracting")
             audio_path = settings.audio_dir / f"{job_id}.wav"
-            await media.extract_audio(clip_path, audio_path, ffmpeg=settings.ffmpeg_path)
+            # A preview-backed job trims here rather than re-exporting: the clip
+            # covers the whole previewed range, the job may want part of it.
+            await media.extract_audio(
+                clip_path,
+                audio_path,
+                ffmpeg=settings.ffmpeg_path,
+                start=record["clip_offset"] or None,
+                duration=record["clip_duration"] or None,
+            )
             info = await media.inspect(audio_path, settings.ffprobe_path)
             if info.duration <= 0:
                 raise media.MediaError("The extracted audio is empty")
@@ -346,7 +374,7 @@ class JobManager:
                 clip_path
                 and clip_path.exists()
                 and not self.settings.keep_clips
-                and record["source"] != "upload"
+                and record["source"] not in ("upload", "preview")
             ):
                 await asyncio.to_thread(clip_path.unlink, True)
 
@@ -451,6 +479,123 @@ class JobManager:
 
         await asyncio.to_thread(write_all)
 
+    # -- previews -----------------------------------------------------------
+
+    async def create_preview(
+        self, *, camera_id: str, camera_name: str, start: datetime, end: datetime
+    ) -> dict[str, Any]:
+        """Export a range so it can be watched and its waveform drawn.
+
+        Returns an existing ready preview for the same range when one survives,
+        so nudging the selection back and forth does not re-export.
+        """
+        start_iso = start.isoformat()
+        end_iso = end.isoformat()
+        existing = await self.previews.find_ready(camera_id, start_iso, end_iso)
+        if existing is not None:
+            log.info(
+                "Reusing preview %s for %s %s..%s", existing["id"], camera_id, start_iso, end_iso
+            )
+            return existing
+
+        preview_id = uuid.uuid4().hex[:12]
+        record = await self.previews.create(
+            id=preview_id,
+            status="exporting",
+            camera_id=camera_id,
+            camera_name=camera_name,
+            range_start=start_iso,
+            range_end=end_iso,
+        )
+        self.events.publish({"type": "preview.created", "preview": record})
+        task = asyncio.create_task(self._run_preview(preview_id), name=f"preview-{preview_id}")
+        self._previews[preview_id] = task
+        task.add_done_callback(lambda _: self._previews.pop(preview_id, None))
+        return record
+
+    async def _set_preview(self, preview_id: str, **fields: Any) -> dict[str, Any] | None:
+        record = await self.previews.update(preview_id, **fields)
+        if record is not None:
+            self.events.publish({"type": "preview.updated", "preview": record})
+        return record
+
+    async def _run_preview(self, preview_id: str) -> None:
+        record = await self.previews.get(preview_id)
+        if record is None:
+            return
+        settings = self.settings
+        clip_path = settings.previews_dir / f"{preview_id}.mp4"
+        audio_path = settings.previews_dir / f"{preview_id}.wav"
+        try:
+            start = _parse_dt(record["range_start"])
+            end = _parse_dt(record["range_end"])
+            if not (start and end):
+                raise ProtectError("Preview has no time range")
+
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            written = 0
+            with clip_path.open("wb") as handle:
+                async for chunk in self.protect.export_clip(record["camera_id"], start, end):
+                    handle.write(chunk)
+                    written += len(chunk)
+            if written == 0:
+                clip_path.unlink(missing_ok=True)
+                raise ProtectError(
+                    "UniFi Protect returned an empty clip for that range -- there may be no "
+                    "footage there."
+                )
+
+            await self._set_preview(
+                preview_id, status="processing", clip_path=str(clip_path), clip_bytes=written
+            )
+
+            info = await media.inspect(clip_path, settings.ffprobe_path)
+            peaks: list[float] = []
+            has_audio = info.has_audio
+            if has_audio:
+                try:
+                    await media.extract_audio(clip_path, audio_path, ffmpeg=settings.ffmpeg_path)
+                    peaks = await media.waveform_peaks(audio_path, settings.waveform_buckets)
+                except media.MediaError as exc:
+                    # Video still plays; the waveform is the part that is missing.
+                    log.warning("Preview %s has no usable audio: %s", preview_id, exc)
+                    has_audio = False
+
+            await self._set_preview(
+                preview_id,
+                status="ready",
+                audio_path=str(audio_path) if has_audio else None,
+                duration=round(info.duration, 3),
+                has_audio=int(has_audio),
+                peaks=peaks,
+                error=None,
+            )
+            log.info(
+                "Preview %s ready: %.1fs, %d waveform buckets, audio=%s",
+                preview_id,
+                info.duration,
+                len(peaks),
+                has_audio,
+            )
+        except asyncio.CancelledError:
+            clip_path.unlink(missing_ok=True)
+            await self._set_preview(preview_id, status="failed", error="Canceled")
+            raise
+        except Exception as exc:
+            log.warning("Preview %s failed: %s", preview_id, exc)
+            await self._set_preview(preview_id, status="failed", error=str(exc)[:1000])
+
+    async def purge_preview(self, preview_id: str) -> bool:
+        task = self._previews.get(preview_id)
+        if task is not None:
+            task.cancel()
+        record = await self.previews.delete(preview_id)
+        if record is None:
+            return False
+        _remove_preview_files(record)
+        self.events.publish({"type": "preview.deleted", "previewId": preview_id})
+        return True
+
     # -- housekeeping -------------------------------------------------------
 
     async def cleanup_expired(self) -> int:
@@ -466,6 +611,18 @@ class JobManager:
                 removed,
                 self.settings.retention_days,
             )
+        return removed
+
+    async def cleanup_previews(self) -> int:
+        """Drop previews past their (much shorter) window, keeping any a job uses."""
+        keep = await self.previews.referenced_by_jobs()
+        removed = 0
+        for record in await self.previews.expired(self.settings.preview_retention_hours, keep):
+            _remove_preview_files(record)
+            await self.previews.delete(record["id"])
+            removed += 1
+        if removed:
+            log.info("Retention: removed %d preview(s)", removed)
         return removed
 
 
@@ -485,8 +642,20 @@ def _parse_dt(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
+def _remove_preview_files(record: dict[str, Any]) -> None:
+    for key in ("clip_path", "audio_path"):
+        raw = record.get(key)
+        if raw:
+            with contextlib.suppress(OSError):
+                Path(raw).unlink(missing_ok=True)
+
+
 def _remove_artifacts(record: dict[str, Any], settings: Settings) -> None:
     for key in ("clip_path", "audio_path"):
+        # The clip under a preview-backed job belongs to the preview, which has
+        # its own retention; deleting the job must not break the preview.
+        if key == "clip_path" and record.get("preview_id"):
+            continue
         raw = record.get(key)
         if raw:
             with contextlib.suppress(OSError):
