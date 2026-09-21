@@ -218,6 +218,7 @@ function renderCameras() {
 }
 
 function selectCamera(camera) {
+  if (state.selectedCamera && state.selectedCamera.id !== camera.id) closePreview();
   state.selectedCamera = camera;
   $("selection-title").textContent = camera.name;
   renderCameras();
@@ -449,6 +450,9 @@ function updateSubmitState() {
   }
   const ready = Boolean(state.selectedCamera && start && end && !reason);
   button.disabled = !ready;
+  // Preview has the same preconditions as transcribing, plus its own length cap
+  // which the server enforces and reports.
+  $("preview-job").disabled = !ready;
   if (reason && start && end) {
     error.textContent = reason;
     error.hidden = false;
@@ -709,6 +713,7 @@ async function openViewer(jobId) {
   ].filter(Boolean);
   $("viewer-meta").textContent = meta.join(" · ");
 
+  state.viewerOffset = job.clipOffset || 0;
   if (job.hasClip) {
     video.src = `/api/jobs/${jobId}/clip${token ? `?token=${encodeURIComponent(token)}` : ""}`;
     video.hidden = false;
@@ -740,6 +745,14 @@ async function openViewer(jobId) {
 
   renderSegments(job);
   $("viewer-find").value = "";
+  $("ask-input").value = "";
+  $("ask-out").replaceChildren();
+  analysisStatus("");
+  // Results are stored on the job, so a reopened transcript shows them again
+  // without paying for another call.
+  if (job.review) renderReview(job.review);
+  else if (job.summary) renderSummary(job.summary);
+  else $("analysis-out").replaceChildren();
   if (!viewer.open) viewer.showModal();
 }
 
@@ -763,7 +776,9 @@ function renderSegments(job) {
     item.append(el("span", "stext", segment.text));
     item.addEventListener("click", () => {
       if (!video.hidden && video.src) {
-        video.currentTime = segment.start;
+        // A preview-backed clip holds the whole previewed range, so shift by
+        // where this job's audio started inside it.
+        video.currentTime = segment.start + (job.clipOffset || 0);
         video.play().catch(() => { /* autoplay policy */ });
       }
     });
@@ -772,7 +787,7 @@ function renderSegments(job) {
 }
 
 video.addEventListener("timeupdate", () => {
-  const now = video.currentTime;
+  const now = video.currentTime - (state.viewerOffset || 0);
   let active = null;
   for (const item of $("viewer-segments").children) {
     const start = Number(item.dataset.start);
@@ -811,6 +826,285 @@ $("viewer-close").addEventListener("click", () => viewer.close());
 viewer.addEventListener("close", () => {
   video.pause();
   state.viewerJob = null;
+});
+
+// --------------------------------------------------------------------------- //
+// preview: watch and listen to a range before transcribing it
+// --------------------------------------------------------------------------- //
+
+const previewVideo = $("preview-video");
+const waveCanvas = $("waveform");
+const waveCtx = waveCanvas.getContext("2d");
+
+const preview = {
+  id: null,
+  peaks: [],
+  duration: 0,
+  start: null, // absolute Date of the previewed clip's first frame
+  hasAudio: false,
+  trim: null, // {from, to} in clip-relative seconds
+  poll: null,
+  drag: null,
+};
+
+function previewStatus(text, kind = "") {
+  const node = $("preview-status");
+  node.className = `preview-status ${kind}`;
+  node.textContent = text;
+}
+
+function resizeWaveform() {
+  const ratio = window.devicePixelRatio || 1;
+  const width = waveCanvas.clientWidth || 600;
+  waveCanvas.width = Math.round(width * ratio);
+  waveCanvas.height = Math.round(80 * ratio);
+  waveCtx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  drawWaveform();
+}
+
+function drawWaveform() {
+  const width = waveCanvas.clientWidth || 600;
+  const height = 80;
+  const mid = height / 2;
+  waveCtx.clearRect(0, 0, width, height);
+  if (!preview.peaks.length) return;
+
+  // trimmed-out regions are dimmed so the kept range reads as the subject
+  const trim = preview.trim;
+  const xOf = (seconds) => (seconds / Math.max(0.001, preview.duration)) * width;
+
+  const bars = preview.peaks.length;
+  const barWidth = width / bars;
+  for (let i = 0; i < bars; i += 1) {
+    const seconds = (i / bars) * preview.duration;
+    const inTrim = !trim || (seconds >= trim.from && seconds <= trim.to);
+    // A floor keeps silence visible as a hairline rather than nothing at all.
+    const amplitude = Math.max(1, preview.peaks[i] * (mid - 4));
+    waveCtx.fillStyle = inTrim ? "#3d8bfd" : "rgba(154,164,178,0.30)";
+    waveCtx.fillRect(i * barWidth, mid - amplitude, Math.max(1, barWidth - 0.5), amplitude * 2);
+  }
+
+  if (trim) {
+    waveCtx.strokeStyle = "#37d399";
+    waveCtx.lineWidth = 1.5;
+    for (const edge of [trim.from, trim.to]) {
+      const x = xOf(edge);
+      waveCtx.beginPath();
+      waveCtx.moveTo(x + 0.5, 2);
+      waveCtx.lineTo(x + 0.5, height - 2);
+      waveCtx.stroke();
+    }
+  }
+
+  // playhead
+  if (previewVideo.duration) {
+    const x = xOf(previewVideo.currentTime);
+    waveCtx.strokeStyle = "#f2685f";
+    waveCtx.lineWidth = 1;
+    waveCtx.beginPath();
+    waveCtx.moveTo(x + 0.5, 0);
+    waveCtx.lineTo(x + 0.5, height);
+    waveCtx.stroke();
+  }
+}
+
+function waveformSeconds(event) {
+  const rect = waveCanvas.getBoundingClientRect();
+  const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+  return ratio * preview.duration;
+}
+
+function updatePreviewRange() {
+  const trim = preview.trim;
+  const from = trim ? trim.from : 0;
+  const to = trim ? trim.to : preview.duration;
+  const length = Math.max(0, to - from);
+  $("preview-reset").hidden = !trim;
+  $("preview-range").innerHTML = trim
+    ? `Trimmed to <strong>${formatDuration(length)}</strong> (${formatClock(from)}–${formatClock(to)} of the preview)`
+    : `Full preview · <strong>${formatDuration(preview.duration)}</strong>`;
+}
+
+waveCanvas.addEventListener("pointerdown", (event) => {
+  if (!preview.peaks.length) return;
+  waveCanvas.setPointerCapture(event.pointerId);
+  preview.drag = { origin: waveformSeconds(event), moved: false };
+});
+
+waveCanvas.addEventListener("pointermove", (event) => {
+  if (!preview.drag) return;
+  preview.drag.moved = true;
+  const current = waveformSeconds(event);
+  preview.trim = {
+    from: Math.min(preview.drag.origin, current),
+    to: Math.max(preview.drag.origin, current),
+  };
+  drawWaveform();
+  updatePreviewRange();
+});
+
+waveCanvas.addEventListener("pointerup", (event) => {
+  if (!preview.drag) return;
+  const seconds = waveformSeconds(event);
+  if (!preview.drag.moved) {
+    // A plain click seeks rather than trimming.
+    previewVideo.currentTime = seconds;
+    previewVideo.play().catch(() => {});
+  } else if (preview.trim && preview.trim.to - preview.trim.from < 0.5) {
+    preview.trim = null; // too small to be deliberate
+  }
+  preview.drag = null;
+  drawWaveform();
+  updatePreviewRange();
+});
+waveCanvas.addEventListener("pointercancel", () => { preview.drag = null; });
+
+previewVideo.addEventListener("timeupdate", drawWaveform);
+previewVideo.addEventListener("seeked", drawWaveform);
+
+function stopPreviewPolling() {
+  if (preview.poll) {
+    clearInterval(preview.poll);
+    preview.poll = null;
+  }
+}
+
+function closePreview() {
+  stopPreviewPolling();
+  previewVideo.pause();
+  previewVideo.removeAttribute("src");
+  previewVideo.load();
+  preview.id = null;
+  preview.peaks = [];
+  preview.trim = null;
+  $("preview-panel").hidden = true;
+}
+
+async function startPreview() {
+  const { start, end } = state.range;
+  if (!state.selectedCamera || !start || !end) return;
+  const button = $("preview-job");
+  button.disabled = true;
+  $("preview-panel").hidden = false;
+  previewVideo.hidden = true;
+  waveCanvas.hidden = true;
+  preview.peaks = [];
+  preview.trim = null;
+  previewStatus("exporting the clip from Protect…", "busy");
+  $("preview-range").textContent = "";
+
+  try {
+    const created = await api("/api/preview", {
+      method: "POST",
+      body: JSON.stringify({
+        cameraId: state.selectedCamera.id,
+        start: start.toISOString(),
+        end: end.toISOString(),
+      }),
+    });
+    preview.id = created.id;
+    preview.start = new Date(created.rangeStart);
+    if (created.status === "ready") {
+      await loadPreview(created.id);
+    } else {
+      stopPreviewPolling();
+      preview.poll = setInterval(() => loadPreview(created.id), 900);
+    }
+  } catch (error) {
+    previewStatus(error.message, "err");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadPreview(previewId) {
+  let record;
+  try {
+    record = await api(`/api/preview/${previewId}`);
+  } catch (error) {
+    stopPreviewPolling();
+    previewStatus(error.message, "err");
+    return;
+  }
+  if (record.status === "failed") {
+    stopPreviewPolling();
+    previewStatus(record.error || "Preview failed", "err");
+    return;
+  }
+  if (record.status !== "ready") {
+    previewStatus(
+      record.status === "processing" ? "reading the audio…" : "exporting the clip from Protect…",
+      "busy"
+    );
+    return;
+  }
+
+  stopPreviewPolling();
+  preview.id = record.id;
+  preview.duration = record.duration || 0;
+  preview.peaks = record.peaks || [];
+  preview.hasAudio = record.hasAudio;
+  preview.start = new Date(record.rangeStart);
+  preview.trim = null;
+
+  previewVideo.src = `/api/preview/${record.id}/clip${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  previewVideo.hidden = false;
+  waveCanvas.hidden = !preview.peaks.length;
+  $("waveform-hint").textContent = preview.peaks.length
+    ? "Drag across the waveform to narrow the range. Click to seek."
+    : "This clip has no audio track, so there is nothing to transcribe.";
+  previewStatus(
+    `${formatDuration(preview.duration)} · ${formatBytes(record.clipBytes)}` +
+      (record.hasAudio ? "" : " · no audio"),
+    record.hasAudio ? "" : "err"
+  );
+  resizeWaveform();
+  updatePreviewRange();
+}
+
+/** Transcribe what is on screen, reusing the already-exported preview clip. */
+async function transcribePreview() {
+  if (!preview.id || !preview.start) return;
+  const trim = preview.trim;
+  const fromSeconds = trim ? trim.from : 0;
+  const toSeconds = trim ? trim.to : preview.duration;
+  const start = new Date(preview.start.getTime() + fromSeconds * 1000);
+  const end = new Date(preview.start.getTime() + toSeconds * 1000);
+
+  const button = $("preview-transcribe");
+  button.disabled = true;
+  try {
+    const job = await api("/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        cameraId: state.selectedCamera.id,
+        previewId: preview.id,
+        start: start.toISOString(),
+        end: end.toISOString(),
+        title: $("opt-title").value.trim(),
+        language: $("opt-language").value.trim() || null,
+        task: $("opt-task").value,
+        prompt: $("opt-prompt").value.trim() || null,
+      }),
+    });
+    toast(`Queued “${job.title}” (${formatDuration((end - start) / 1000)}) — no re-export needed`, "ok");
+    upsertJob(job);
+    // Fold the trim back into the main selection so the timeline agrees.
+    setRange(start, end);
+  } catch (error) {
+    toast(`Could not queue the job: ${error.message}`, "err");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("preview-job").addEventListener("click", startPreview);
+$("preview-close").addEventListener("click", closePreview);
+$("preview-transcribe").addEventListener("click", transcribePreview);
+$("preview-reset").addEventListener("click", () => {
+  preview.trim = null;
+  drawWaveform();
+  updatePreviewRange();
 });
 
 // --------------------------------------------------------------------------- //
@@ -998,6 +1292,199 @@ $("instance-add").addEventListener("click", () => {
 instancesDialog.addEventListener("close", () => refreshWhisperStatus());
 
 // --------------------------------------------------------------------------- //
+// transcript analysis (summary / review / ask)
+// --------------------------------------------------------------------------- //
+
+const analysisDialog = $("analysis-dialog");
+
+async function refreshAnalysisState() {
+  try {
+    const config = await api("/api/analysis");
+    const node = $("analysis-state");
+    node.className = `analysis-state ${config.ready ? "ready" : ""}`;
+    node.textContent = config.ready
+      ? `${config.model}`
+      : config.baseUrl
+        ? "configured but disabled"
+        : "Not configured";
+    state.analysisReady = config.ready;
+    return config;
+  } catch {
+    return null;
+  }
+}
+
+async function openAnalysisSettings() {
+  const config = (await refreshAnalysisState()) || {};
+  $("an-url").value = config.baseUrl || "";
+  $("an-model").value = config.model || "";
+  $("an-enabled").checked = Boolean(config.enabled);
+  $("an-key").value = "";
+  $("an-key").placeholder = config.hasApiKey ? "•••••• (unchanged)" : "none";
+  $("an-state").textContent = config.ready ? "ready" : "";
+  $("an-state").className = `instance-state ${config.ready ? "ok" : ""}`;
+  if (!analysisDialog.open) analysisDialog.showModal();
+}
+
+function analysisPayload() {
+  const payload = {
+    baseUrl: $("an-url").value.trim(),
+    model: $("an-model").value.trim(),
+    enabled: $("an-enabled").checked,
+  };
+  // An untouched key box means "keep what is stored".
+  const key = $("an-key").value;
+  if (key) payload.apiKey = key;
+  return payload;
+}
+
+$("open-analysis").addEventListener("click", openAnalysisSettings);
+$("analysis-close").addEventListener("click", () => analysisDialog.close());
+
+$("an-test").addEventListener("click", async () => {
+  const node = $("an-state");
+  node.className = "instance-state busy";
+  node.textContent = "testing…";
+  try {
+    const result = await api("/api/analysis/test", {
+      method: "POST",
+      body: JSON.stringify(analysisPayload()),
+    });
+    if (!result.reachable) {
+      node.className = "instance-state err";
+      node.textContent = result.detail || "unreachable";
+      return;
+    }
+    node.className = "instance-state ok";
+    node.textContent = `reachable · ${result.models.length} model(s)`;
+    const list = $("an-models");
+    list.replaceChildren();
+    for (const model of result.models) {
+      const option = el("option");
+      option.value = model;
+      list.append(option);
+    }
+  } catch (error) {
+    node.className = "instance-state err";
+    node.textContent = error.message;
+  }
+});
+
+$("an-save").addEventListener("click", async () => {
+  try {
+    await api("/api/analysis", { method: "PUT", body: JSON.stringify(analysisPayload()) });
+    toast("Analysis settings saved", "ok");
+    await refreshAnalysisState();
+    analysisDialog.close();
+  } catch (error) {
+    $("an-state").className = "instance-state err";
+    $("an-state").textContent = error.message;
+  }
+});
+
+function analysisStatus(text, kind = "") {
+  const node = $("analysis-status");
+  node.className = `analysis-status ${kind}`;
+  node.textContent = text;
+}
+
+/** Jump the player to a [mm:ss] timestamp the model quoted. */
+function seekToStamp(stamp) {
+  const match = /(\d+):(\d+)/.exec(stamp || "");
+  if (!match || video.hidden || !video.src) return;
+  video.currentTime =
+    Number(match[1]) * 60 + Number(match[2]) + (state.viewerOffset || 0);
+  video.play().catch(() => {});
+}
+
+function renderSummary(result) {
+  const out = $("analysis-out");
+  out.replaceChildren();
+  if (!result.summary && !(result.points || []).length) {
+    out.append(el("p", "muted", "The model returned nothing for this transcript."));
+    return;
+  }
+  out.append(el("h4", null, "Summary"));
+  if (result.summary) out.append(el("p", null, result.summary));
+  if ((result.points || []).length) {
+    const list = el("ul");
+    for (const point of result.points) list.append(el("li", null, point));
+    out.append(list);
+  }
+  if (result.speakers) out.append(el("p", "muted", `Voices: ${result.speakers}`));
+}
+
+function renderReview(result) {
+  const out = $("analysis-out");
+  out.replaceChildren();
+  out.append(el("h4", null, "Review"));
+  if (result.assessment) out.append(el("p", null, result.assessment));
+
+  const flags = result.flags || [];
+  if (!flags.length) {
+    out.append(el("p", "muted", "Nothing flagged."));
+    return;
+  }
+  for (const flag of flags) {
+    const node = el("div", `flag ${flag.severity}`);
+    const head = el("div", "flag-head");
+    head.append(el("span", "sev", flag.severity));
+    head.append(el("span", null, flag.category));
+    if (flag.timestamp) {
+      const stamp = el("time", null, flag.timestamp);
+      stamp.addEventListener("click", () => seekToStamp(flag.timestamp));
+      head.append(stamp);
+    }
+    node.append(head);
+    if (flag.quote) node.append(el("div", "flag-quote", `“${flag.quote}”`));
+    if (flag.reason) node.append(el("div", "flag-why", flag.reason));
+    out.append(node);
+  }
+  out.append(
+    el("p", "muted", "Flags come from an ASR transcript and can be wrong — check the audio.")
+  );
+}
+
+async function runAnalysis(kind) {
+  if (!state.viewerJob) return;
+  const label = kind === "summarize" ? "Summarising" : "Reviewing";
+  analysisStatus(`${label}…`, "busy");
+  for (const id of ["do-summarize", "do-review"]) $(id).disabled = true;
+  try {
+    const result = await api(`/api/jobs/${state.viewerJob}/${kind}`, { method: "POST" });
+    analysisStatus("");
+    if (kind === "summarize") renderSummary(result);
+    else renderReview(result);
+  } catch (error) {
+    analysisStatus(error.message, "err");
+  } finally {
+    for (const id of ["do-summarize", "do-review"]) $(id).disabled = false;
+  }
+}
+
+$("do-summarize").addEventListener("click", () => runAnalysis("summarize"));
+$("do-review").addEventListener("click", () => runAnalysis("review"));
+
+$("ask-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const question = $("ask-input").value.trim();
+  if (!question || !state.viewerJob) return;
+  const out = $("ask-out");
+  out.replaceChildren(el("p", "muted", "Thinking…"));
+  try {
+    const result = await api(`/api/jobs/${state.viewerJob}/ask`, {
+      method: "POST",
+      body: JSON.stringify({ question }),
+    });
+    out.replaceChildren();
+    out.append(el("h4", null, question));
+    out.append(el("p", null, result.answer || "No answer."));
+  } catch (error) {
+    out.replaceChildren(el("p", "muted", error.message));
+  }
+});
+
+// --------------------------------------------------------------------------- //
 // wiring
 // --------------------------------------------------------------------------- //
 
@@ -1050,7 +1537,10 @@ $("job-search").addEventListener("input", (event) => {
   searchTimer = setTimeout(() => runSearch(value), 250);
 });
 
-window.addEventListener("resize", resizeCanvas);
+window.addEventListener("resize", () => {
+  resizeCanvas();
+  if (!$("preview-panel").hidden) resizeWaveform();
+});
 document.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !$("submit-job").disabled) {
     submitJob();
@@ -1072,7 +1562,13 @@ async function init() {
   const now = new Date();
   setRange(new Date(now.getTime() - 15 * 60000), now);
   resizeCanvas();
-  await Promise.all([loadCameras(), loadJobs(), refreshProtectStatus(), refreshWhisperStatus()]);
+  await Promise.all([
+    loadCameras(),
+    loadJobs(),
+    refreshProtectStatus(),
+    refreshWhisperStatus(),
+    refreshAnalysisState(),
+  ]);
   connectStream();
   // Keep the "now" needle and instance load roughly current.
   setInterval(drawTimeline, 30000);

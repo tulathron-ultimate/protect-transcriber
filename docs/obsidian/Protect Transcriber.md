@@ -133,6 +133,24 @@ These are the things that cost time to work out.
   instead, and treat an omitted key on PATCH as "keep", an explicit `""` as
   "clear" (`model_dump(exclude_unset=True)` in pydantic v2 makes this exact).
 
+### LLM analysis
+
+- **A ChatGPT Plus/Pro subscription is NOT API access.** OpenAI runs the two as
+  separate billing systems; api.openai.com needs a platform key with its own
+  credits. Easy and expensive assumption to get wrong.
+- Writing against the **OpenAI chat-completions shape with a configurable base
+  URL** means one adapter covers OpenAI, Ollama, LM Studio, vLLM, LocalAI and
+  OpenRouter. Same trick as the Whisper backends.
+- Normalise the base URL: people write it with and without `/v1`, and sometimes
+  paste the full `/chat/completions`. Handle all three.
+- Models wrap JSON in ``` fences and add chatter; parse with a fence-strip then
+  an outermost-braces fallback rather than trusting `response_format`.
+- Map-reduce long transcripts: summarise per chunk, then combine. For Q&A, have
+  each chunk reply `NOTHING RELEVANT` so irrelevant parts drop out cheaply.
+- Feed the model `[mm:ss]` prefixed lines so it can cite timestamps, then make
+  those clickable to seek the video.
+- Store results on the job: reopening a transcript should not re-bill.
+
 ### Unraid templates and GHCR
 
 - **Unraid reads template repos natively.** Docker tab → **Template

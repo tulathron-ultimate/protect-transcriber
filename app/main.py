@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 from fastapi import (
     Depends,
     FastAPI,
@@ -28,10 +29,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import media
+from .analysis import AnalysisClient, AnalysisConfig, AnalysisError, AnalysisNotConfigured
 from .config import BackendKind, Settings, WhisperInstance, get_settings
 from .jobs import JobManager
 from .protect import ProtectAuthError, ProtectClient, ProtectError
-from .store import InstanceStore, JobStore
+from .store import AnalysisConfigStore, InstanceStore, JobStore, PreviewStore
 from .transcript import Segment, to_srt, to_vtt, to_wallclock_text
 from .whisper import BACKENDS, NoHealthyInstances, OpenAIBackend, WhisperPool
 
@@ -49,6 +51,9 @@ class JobRequest(BaseModel):
     camera_id: str = Field(alias="cameraId", min_length=1)
     start: datetime
     end: datetime
+    # When set, the clip already on disk for that preview is used instead of a
+    # fresh export; start/end must fall inside the previewed range.
+    preview_id: str | None = Field(default=None, alias="previewId")
     title: str = ""
     language: str | None = None
     task: Literal["transcribe", "translate"] = "transcribe"
@@ -60,6 +65,42 @@ class JobRequest(BaseModel):
     @classmethod
     def _aware(cls, value: datetime) -> datetime:
         # Treat a naive timestamp as UTC; the UI always sends an offset.
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+class AnalysisSettings(BaseModel):
+    """The LLM endpoint used for summaries, review and Q&A."""
+
+    base_url: str = Field(default="", alias="baseUrl", max_length=500)
+    api_key: str | None = Field(default=None, alias="apiKey")
+    model: str = Field(default="", max_length=200)
+    enabled: bool = False
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("base_url")
+    @classmethod
+    def _needs_scheme(cls, value: str) -> str:
+        value = (value or "").strip().rstrip("/")
+        if value and not value.startswith(("http://", "https://")):
+            raise ValueError("Base URL must start with http:// or https://")
+        return value
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=1000)
+
+
+class PreviewRequest(BaseModel):
+    camera_id: str = Field(alias="cameraId", min_length=1)
+    start: datetime
+    end: datetime
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("start", "end")
+    @classmethod
+    def _aware(cls, value: datetime) -> datetime:
         return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
@@ -161,6 +202,7 @@ async def _retention_loop(manager: JobManager) -> None:
     while True:
         try:
             await manager.cleanup_expired()
+            await manager.cleanup_previews()
         except Exception:  # pragma: no cover - never kill the loop
             log.exception("Retention sweep failed")
         await asyncio.sleep(6 * 3600)
@@ -175,6 +217,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     store = JobStore(settings.db_path)
     await store.init()
 
+    previews = PreviewStore(settings.db_path)
+    analysis = AnalysisConfigStore(settings.db_path)
+    # Its own client: the Whisper pool's carries a 30-minute read timeout meant
+    # for transcription, which is far too long to wait on a chat completion.
+    http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=180.0))
     instances = InstanceStore(settings.db_path)
     # First start: lift whatever is in WHISPER_INSTANCES into the database so it
     # shows up in the UI ready to edit. After that the database wins, or a
@@ -197,11 +244,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     rows = await instances.list()
     pool = WhisperPool(settings, instances=[_instance_from_row(row) for row in rows])
     protect = ProtectClient(settings)
-    manager = JobManager(settings, store, pool, protect)
+    manager = JobManager(settings, store, pool, protect, previews=previews)
     await manager.start()
 
     app.state.store = store
     app.state.instances = instances
+    app.state.previews = previews
+    app.state.analysis = analysis
+    app.state.http = http
     app.state.pool = pool
     app.state.protect = protect
     app.state.manager = manager
@@ -225,6 +275,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError):
             await app.state.retention_task
         await manager.stop()
+        await http.aclose()
         await pool.aclose()
         await protect.aclose()
 
@@ -469,6 +520,193 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={"Cache-Control": "max-age=30"},
         )
 
+    # -- transcript analysis --------------------------------------------------
+
+    def get_analysis_store() -> AnalysisConfigStore:
+        return app.state.analysis
+
+    async def _analysis_client() -> AnalysisClient:
+        row = await app.state.analysis.get()
+        config = AnalysisConfig(
+            base_url=row["base_url"],
+            api_key=row["api_key"],
+            model=row["model"],
+            enabled=bool(row["enabled"]),
+        )
+        if not config.ready:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No analysis endpoint configured. Set one under Analysis in the UI. "
+                    "Note a ChatGPT subscription does not include API access -- OpenAI's "
+                    "API is billed separately, or point this at a local model."
+                ),
+            )
+        return AnalysisClient(config, client=app.state.http)
+
+    async def _segments_for(job_id: str) -> tuple[dict[str, Any], list[Segment]]:
+        job = await app.state.store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such job")
+        if job["status"] != "completed":
+            raise HTTPException(status_code=409, detail="That job has no transcript yet")
+        segments = [
+            Segment(start=s.get("start", 0.0), end=s.get("end", 0.0), text=s.get("text", ""))
+            for s in job["segments"]
+        ]
+        if not segments and job["text"]:
+            segments = [Segment(start=0.0, end=0.0, text=job["text"])]
+        return job, segments
+
+    @app.get("/api/analysis", dependencies=[Guard])
+    async def get_analysis(store: AnalysisConfigStore = Depends(get_analysis_store)) -> dict:
+        row = await store.get()
+        config = AnalysisConfig(
+            base_url=row["base_url"], model=row["model"], enabled=bool(row["enabled"])
+        )
+        return {
+            "baseUrl": row["base_url"],
+            "model": row["model"],
+            "enabled": bool(row["enabled"]),
+            "hasApiKey": bool(row["api_key"]),
+            "ready": config.ready,
+        }
+
+    @app.put("/api/analysis", dependencies=[Guard])
+    async def save_analysis(
+        payload: AnalysisSettings, store: AnalysisConfigStore = Depends(get_analysis_store)
+    ) -> dict:
+        fields: dict[str, Any] = {
+            "base_url": payload.base_url,
+            "model": payload.model.strip(),
+            "enabled": int(payload.enabled),
+        }
+        # Omitting the key keeps the stored one; sending "" clears it.
+        if payload.api_key is not None:
+            fields["api_key"] = payload.api_key
+        await store.save(**fields)
+        return await get_analysis(store)
+
+    @app.post("/api/analysis/test", dependencies=[Guard])
+    async def test_analysis(payload: AnalysisSettings) -> dict:
+        stored = await app.state.analysis.get()
+        config = AnalysisConfig(
+            base_url=payload.base_url,
+            # Fall back to the saved key so Test works without retyping it.
+            api_key=payload.api_key if payload.api_key is not None else stored["api_key"],
+            model=payload.model,
+            enabled=True,
+        )
+        if not config.base_url:
+            raise HTTPException(status_code=400, detail="Enter a base URL first")
+        client = AnalysisClient(config, client=app.state.http)
+        try:
+            models = await client.models()
+        except Exception as exc:  # noqa: BLE001 - any transport/HTTP error is just "no"
+            return {"reachable": False, "models": [], "detail": str(exc)[:300]}
+        return {"reachable": True, "models": models[:500]}
+
+    @app.post("/api/jobs/{job_id}/summarize", dependencies=[Guard])
+    async def summarize_job(job_id: str) -> dict:
+        _, segments = await _segments_for(job_id)
+        client = await _analysis_client()
+        try:
+            result = await client.summarize(segments)
+        except (AnalysisError, AnalysisNotConfigured) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        await app.state.store.update(job_id, summary=json.dumps(result))
+        return result
+
+    @app.post("/api/jobs/{job_id}/review", dependencies=[Guard])
+    async def review_job(job_id: str) -> dict:
+        _, segments = await _segments_for(job_id)
+        client = await _analysis_client()
+        try:
+            result = await client.review(segments)
+        except (AnalysisError, AnalysisNotConfigured) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        await app.state.store.update(job_id, review=json.dumps(result))
+        return result
+
+    @app.post("/api/jobs/{job_id}/ask", dependencies=[Guard])
+    async def ask_job(job_id: str, payload: AskRequest) -> dict:
+        _, segments = await _segments_for(job_id)
+        client = await _analysis_client()
+        try:
+            return await client.ask(segments, payload.question.strip())
+        except (AnalysisError, AnalysisNotConfigured) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # -- previews -----------------------------------------------------------
+
+    def get_previews() -> PreviewStore:
+        return app.state.previews
+
+    @app.post("/api/preview", status_code=202, dependencies=[Guard])
+    async def create_preview(
+        payload: PreviewRequest,
+        manager: JobManager = Depends(get_manager),
+        client: ProtectClient = Depends(get_protect),
+    ) -> dict[str, Any]:
+        span = (payload.end - payload.start).total_seconds()
+        if span <= 0:
+            raise HTTPException(status_code=400, detail="End must be after start")
+        if span > settings.preview_max_seconds:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Preview is limited to {settings.preview_max_seconds // 60} min "
+                    f"(this range is {span / 60:.0f} min). Narrow the selection, or raise "
+                    "PREVIEW_MAX_SECONDS."
+                ),
+            )
+        if payload.start > datetime.now(tz=UTC):
+            raise HTTPException(status_code=400, detail="Start is in the future")
+
+        camera_name = payload.camera_id
+        try:
+            camera_name = (await client.camera(payload.camera_id)).name
+        except ProtectError:
+            log.warning("Could not look up camera %s for preview", payload.camera_id)
+
+        record = await manager.create_preview(
+            camera_id=payload.camera_id,
+            camera_name=camera_name,
+            start=payload.start,
+            end=payload.end,
+        )
+        return _public_preview(record)
+
+    @app.get("/api/preview/{preview_id}", dependencies=[Guard])
+    async def get_preview(
+        preview_id: str, store: PreviewStore = Depends(get_previews)
+    ) -> dict[str, Any]:
+        record = await store.get(preview_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="No such preview")
+        return _public_preview(record, include_peaks=True)
+
+    @app.get("/api/preview/{preview_id}/clip", dependencies=[Guard])
+    async def preview_clip(
+        preview_id: str, store: PreviewStore = Depends(get_previews)
+    ) -> FileResponse:
+        record = await store.get(preview_id)
+        if record is None or not record["clip_path"]:
+            raise HTTPException(status_code=404, detail="No such preview")
+        path = Path(record["clip_path"])
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="The preview clip has been cleaned up")
+        # FileResponse serves Range requests, which the <video> needs to seek.
+        return FileResponse(path, media_type="video/mp4")
+
+    @app.delete("/api/preview/{preview_id}", dependencies=[Guard])
+    async def delete_preview(
+        preview_id: str, manager: JobManager = Depends(get_manager)
+    ) -> dict[str, Any]:
+        if not await manager.purge_preview(preview_id):
+            raise HTTPException(status_code=404, detail="No such preview")
+        return {"deleted": preview_id}
+
     # -- jobs ---------------------------------------------------------------
 
     @app.post("/api/jobs", status_code=202, dependencies=[Guard])
@@ -503,6 +741,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Don't block the job on a metadata hiccup -- the export is the real test.
             log.warning("Could not look up camera %s: %s", payload.camera_id, exc)
 
+        # A preview already exported this footage, so reuse its clip and trim
+        # to the requested window instead of pulling it from the NVR again.
+        preview_id: str | None = None
+        clip_path: Path | None = None
+        offset = 0.0
+        duration: float | None = None
+        if payload.preview_id:
+            preview = await app.state.previews.get(payload.preview_id)
+            if preview is None or preview["status"] != "ready":
+                raise HTTPException(status_code=409, detail="That preview is not ready")
+            if not preview["clip_path"] or not Path(preview["clip_path"]).exists():
+                raise HTTPException(status_code=409, detail="The preview clip has been cleaned up")
+            preview_start = datetime.fromisoformat(preview["range_start"])
+            preview_end = datetime.fromisoformat(preview["range_end"])
+            if payload.start < preview_start or payload.end > preview_end:
+                raise HTTPException(
+                    status_code=400,
+                    detail="The requested range is not inside that preview",
+                )
+            preview_id = payload.preview_id
+            clip_path = Path(preview["clip_path"])
+            offset = max(0.0, (payload.start - preview_start).total_seconds())
+            duration = span
+
         return await manager.submit(
             camera_id=payload.camera_id,
             camera_name=camera_name,
@@ -512,6 +774,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             language=payload.language or settings.whisper_language or None,
             task=payload.task,
             prompt=payload.prompt,
+            source="preview" if preview_id else "protect",
+            preview_id=preview_id,
+            clip_path=clip_path,
+            clip_offset=offset,
+            clip_duration=duration,
         )
 
     @app.post("/api/jobs/upload", status_code=202, dependencies=[Guard])
@@ -703,6 +970,25 @@ def _slug(value: str) -> str:
     return ("-".join(cleaned.split()) or "transcript")[:80]
 
 
+def _public_preview(record: dict[str, Any], include_peaks: bool = False) -> dict[str, Any]:
+    payload = {
+        "id": record["id"],
+        "status": record["status"],
+        "cameraId": record["camera_id"],
+        "cameraName": record["camera_name"],
+        "rangeStart": record["range_start"],
+        "rangeEnd": record["range_end"],
+        "duration": record["duration"],
+        "hasAudio": bool(record["has_audio"]),
+        "clipBytes": record["clip_bytes"],
+        "error": record["error"],
+        "createdAt": record["created_at"],
+    }
+    if include_peaks:
+        payload["peaks"] = record["peaks"]
+    return payload
+
+
 def _public_job(job: dict[str, Any], include_segments: bool = False) -> dict[str, Any]:
     """Map a DB row to the camelCase shape the UI consumes."""
     payload = {
@@ -729,11 +1015,22 @@ def _public_job(job: dict[str, Any], include_segments: bool = False) -> dict[str
         "startedAt": job["started_at"],
         "finishedAt": job["finished_at"],
         "hasClip": bool(job["clip_path"]),
+        "previewId": job["preview_id"],
+        # Playback offset: a preview-backed clip holds the whole previewed range,
+        # so segment timestamps need shifting to line up with the video.
+        "clipOffset": job["clip_offset"] or 0.0,
         "textLength": len(job["text"] or ""),
     }
     if include_segments:
         payload["text"] = job["text"]
         payload["segments"] = job["segments"]
+        for key in ("summary", "review"):
+            raw = job.get(key)
+            if raw:
+                try:
+                    payload[key] = json.loads(raw)
+                except (TypeError, ValueError):
+                    payload[key] = None
     else:
         payload["preview"] = (job["text"] or "")[:280]
     return payload

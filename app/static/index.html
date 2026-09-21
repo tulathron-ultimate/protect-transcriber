@@ -41,6 +41,11 @@
         <h2>Whisper</h2>
         <button class="ghost" id="open-instances" type="button" title="Configure Whisper instances">Configure</button>
       </div>
+      <div class="instances-head">
+        <h2>Analysis</h2>
+        <button class="ghost" id="open-analysis" type="button" title="Configure the LLM used for summaries and review">Configure</button>
+      </div>
+      <p class="analysis-state" id="analysis-state">Not configured</p>
       <div class="instances" id="instance-list"></div>
     </aside>
 
@@ -101,7 +106,31 @@
         </div>
       </details>
 
+      <!-- preview: watch and listen before committing to a transcription -->
+      <section class="preview" id="preview-panel" hidden>
+        <div class="preview-head">
+          <h2>Preview</h2>
+          <span class="preview-status" id="preview-status"></span>
+          <div class="spacer"></div>
+          <button class="ghost" id="preview-close" type="button" aria-label="Close preview">✕</button>
+        </div>
+        <video id="preview-video" controls preload="metadata" playsinline></video>
+        <div class="waveform-wrap">
+          <canvas id="waveform" height="80" aria-label="Audio waveform — drag to narrow the range"></canvas>
+          <p class="waveform-hint" id="waveform-hint">
+            Drag across the waveform to narrow the range. Click to seek.
+          </p>
+        </div>
+        <div class="preview-actions">
+          <span class="preview-range" id="preview-range"></span>
+          <div class="spacer"></div>
+          <button class="ghost" id="preview-reset" type="button" hidden>Clear trim</button>
+          <button class="primary" id="preview-transcribe" type="button">Transcribe this</button>
+        </div>
+      </section>
+
       <div class="actions">
+        <button class="ghost" id="preview-job" type="button" disabled>Preview</button>
         <button class="primary" id="submit-job" type="button" disabled>Transcribe selection</button>
         <label class="upload-btn">
           Upload a clip instead
@@ -138,6 +167,20 @@
         <input class="filter" id="viewer-find" type="search" placeholder="Find in transcript…" aria-label="Find in transcript" />
         <div class="downloads" id="viewer-downloads"></div>
       </div>
+      <section class="analysis" id="analysis-panel">
+        <div class="analysis-actions">
+          <button class="ghost" id="do-summarize" type="button">Summarise</button>
+          <button class="ghost" id="do-review" type="button">Review for concerns</button>
+          <span class="analysis-status" id="analysis-status"></span>
+        </div>
+        <div class="analysis-out" id="analysis-out"></div>
+        <form class="ask-form" id="ask-form">
+          <input type="text" id="ask-input" placeholder="Ask about this transcript…" maxlength="1000" />
+          <button class="ghost" type="submit">Ask</button>
+        </form>
+        <div class="analysis-out" id="ask-out"></div>
+      </section>
+
       <ol class="segments" id="viewer-segments"></ol>
     </div>
   </dialog>
@@ -199,6 +242,44 @@
       </div>
     </li>
   </template>
+
+  <!-- analysis settings ----------------------------------------------------- -->
+  <dialog class="viewer analysis-dialog" id="analysis-dialog">
+    <div class="viewer-head">
+      <div>
+        <h3>Transcript analysis</h3>
+        <p class="viewer-meta">Any OpenAI-compatible chat endpoint — OpenAI's API, or a local model.</p>
+      </div>
+      <button class="ghost close" id="analysis-close" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="viewer-body">
+      <div class="instance-grid">
+        <label class="f-url">Base URL
+          <input type="url" id="an-url" placeholder="http://10.0.0.2:11434/v1" />
+        </label>
+        <label class="f-model">Model
+          <input type="text" id="an-model" list="an-models" placeholder="gpt-4o-mini or llama3.1" />
+          <datalist id="an-models"></datalist>
+        </label>
+        <label class="f-key">API key
+          <input type="password" id="an-key" placeholder="none" autocomplete="off" />
+        </label>
+      </div>
+      <div class="instance-row-foot">
+        <label class="toggle"><input type="checkbox" id="an-enabled" /> Enabled</label>
+        <span class="instance-state" id="an-state"></span>
+        <div class="spacer"></div>
+        <button class="ghost" id="an-test" type="button">Test</button>
+        <button class="ghost" id="an-save" type="button">Save</button>
+      </div>
+      <p class="analysis-note">
+        A <strong>ChatGPT Plus/Pro subscription does not include API access</strong> — OpenAI bills
+        the API separately, so <code>https://api.openai.com/v1</code> needs a platform key with its
+        own credits. A local model (Ollama, LM Studio, vLLM) costs nothing and keeps recordings of
+        your household off a third party's servers.
+      </p>
+    </div>
+  </dialog>
 
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
   <script src="/static/app.js"></script>

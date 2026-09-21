@@ -584,3 +584,149 @@ input[type="date"], input[type="datetime-local"] { color-scheme: dark; }
   flex-wrap: wrap;
 }
 .instance-actions .hint { font-size: 11.5px; color: var(--text-faint); }
+
+/* ---------- preview player + waveform ---------- */
+
+.preview {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  padding: 12px;
+  margin: 4px 0 14px;
+}
+.preview[hidden] { display: none; }
+
+.preview-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.preview-head .spacer { flex: 1; }
+.preview-status { font-size: 12px; color: var(--text-dim); font-family: var(--mono); }
+.preview-status.err { color: var(--err); }
+.preview-status.busy { color: var(--accent); }
+
+#preview-video {
+  width: 100%;
+  max-height: 42vh;
+  background: #000;
+  border-radius: var(--radius-sm);
+  display: block;
+}
+#preview-video[hidden] { display: none; }
+
+.waveform-wrap { margin-top: 10px; }
+#waveform {
+  width: 100%;
+  height: 80px;
+  display: block;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  cursor: crosshair;
+  touch-action: none;
+}
+#waveform[hidden] { display: none; }
+.waveform-hint { margin: 6px 0 0; font-size: 11.5px; color: var(--text-faint); }
+
+.preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.preview-actions .spacer { flex: 1; }
+.preview-range {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.preview-range strong { color: var(--text); font-weight: 600; }
+
+/* ---------- transcript analysis ---------- */
+
+.analysis-state { margin: 6px 0 0; font-size: 11.5px; color: var(--text-faint); }
+.analysis-state.ready { color: var(--ok); }
+
+.analysis-dialog { width: min(680px, 94vw); }
+.analysis-note {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  background: rgba(240, 180, 41, 0.08);
+  border: 1px solid rgba(240, 180, 41, 0.28);
+  border-radius: var(--radius-sm);
+}
+.analysis-note code { font-family: var(--mono); font-size: 11.5px; color: var(--text); }
+
+.analysis {
+  border-top: 1px solid var(--line-soft);
+  margin: 14px 0 10px;
+  padding-top: 12px;
+}
+.analysis-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.analysis-actions button { font-size: 12px; }
+.analysis-status { font-size: 11.5px; color: var(--text-faint); font-family: var(--mono); }
+.analysis-status.busy { color: var(--accent); }
+.analysis-status.err { color: var(--err); }
+
+.analysis-out:empty { display: none; }
+.analysis-out {
+  margin-top: 10px;
+  padding: 11px 12px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.analysis-out h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+.analysis-out ul { margin: 0; padding-left: 18px; }
+.analysis-out li { margin-bottom: 3px; }
+.analysis-out .muted { color: var(--text-faint); font-size: 12px; }
+
+.flag {
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  margin-top: 8px;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--text-faint);
+  background: var(--bg);
+}
+.flag.high { border-left-color: var(--err); }
+.flag.medium { border-left-color: var(--warn); }
+.flag.low { border-left-color: var(--accent); }
+.flag-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+.flag-head .sev { font-weight: 700; }
+.flag.high .sev { color: var(--err); }
+.flag.medium .sev { color: var(--warn); }
+.flag-quote {
+  font-style: italic;
+  color: var(--text);
+  border-left: 2px solid var(--line);
+  padding-left: 8px;
+}
+.flag-why { font-size: 12px; color: var(--text-dim); }
+.flag time { font-family: var(--mono); color: var(--accent); cursor: pointer; }
+
+.ask-form { display: flex; gap: 8px; margin-top: 12px; }
+.ask-form input { flex: 1; }
