@@ -157,8 +157,15 @@ async function refreshWhisperStatus(refresh = false) {
         : `${instance.url} — ${instance.detail}`;
       list.append(row);
     }
+    if (!total) {
+      const empty = el("div", "instance", "No instances configured");
+      empty.style.color = "var(--text-faint)";
+      list.append(empty);
+    }
+    return data;
   } catch (error) {
     setPill("pill-whisper", "err", "Whisper", error.message);
+    return null;
   }
 }
 
@@ -807,11 +814,199 @@ viewer.addEventListener("close", () => {
 });
 
 // --------------------------------------------------------------------------- //
+// whisper instance settings
+// --------------------------------------------------------------------------- //
+
+const instancesDialog = $("instances-dialog");
+
+/** Read a row's form values back out as an API payload. */
+function readRow(row) {
+  const value = (field) => row.querySelector(`[data-field="${field}"]`);
+  return {
+    name: value("name").value.trim(),
+    url: value("url").value.trim(),
+    kind: value("kind").value,
+    model: value("model").value.trim(),
+    concurrency: Number(value("concurrency").value) || 1,
+    apiKey: value("apiKey").value,
+    enabled: value("enabled").checked,
+  };
+}
+
+function setRowState(row, text, kind = "") {
+  const node = row.querySelector('[data-role="state"]');
+  node.className = `instance-state ${kind}`;
+  node.textContent = text;
+}
+
+function buildRow(instance) {
+  const row = $("instance-row-template").content.firstElementChild.cloneNode(true);
+  const field = (name) => row.querySelector(`[data-field="${name}"]`);
+  row.dataset.id = instance?.id ?? "";
+  field("name").value = instance?.name ?? "";
+  field("url").value = instance?.url ?? "";
+  field("kind").value = instance?.kind ?? "auto";
+  field("model").value = instance?.model ?? "";
+  field("concurrency").value = instance?.concurrency ?? 1;
+  field("enabled").checked = instance?.enabled ?? true;
+  // The key itself is never sent to the browser; show a placeholder when one is
+  // stored so an empty box does not look like "no key".
+  field("apiKey").placeholder = instance?.hasApiKey ? "•••••• (unchanged)" : "none";
+
+  if (instance?.status) {
+    const status = instance.status;
+    setRowState(
+      row,
+      status.healthy
+        ? `${status.kind}${status.realtimeFactor ? ` · ${status.realtimeFactor}×` : ""}`
+        : status.detail,
+      status.healthy ? "ok" : "err"
+    );
+  } else if (instance && !instance.enabled) {
+    setRowState(row, "disabled");
+  } else if (!instance) {
+    setRowState(row, "unsaved");
+  }
+
+  for (const input of row.querySelectorAll("[data-field]")) {
+    input.addEventListener("input", () => row.classList.add("dirty"));
+    input.addEventListener("change", () => row.classList.add("dirty"));
+  }
+
+  row.querySelector('[data-action="test"]').addEventListener("click", () => testRow(row));
+  row.querySelector('[data-action="save"]').addEventListener("click", () => saveRow(row));
+  row.querySelector('[data-action="delete"]').addEventListener("click", () => deleteRow(row));
+  return row;
+}
+
+async function loadInstances() {
+  try {
+    const data = await api("/api/whisper/instances");
+    const editorList = $("instance-editor");
+    editorList.replaceChildren();
+    for (const instance of data.instances) editorList.append(buildRow(instance));
+    $("instance-hint").textContent = data.instances.length
+      ? "Changes apply as soon as you save — no container restart."
+      : "No instances yet. Add the URL of a Whisper container on your network.";
+    return data.instances;
+  } catch (error) {
+    toast(`Could not load instances: ${error.message}`, "err");
+    return [];
+  }
+}
+
+async function testRow(row) {
+  const payload = readRow(row);
+  if (!payload.url) {
+    setRowState(row, "enter a URL first", "err");
+    return;
+  }
+  setRowState(row, "testing…", "busy");
+  try {
+    const result = await api("/api/whisper/instances/test", {
+      method: "POST",
+      body: JSON.stringify({ url: payload.url, kind: payload.kind, apiKey: payload.apiKey }),
+    });
+    if (!result.reachable) {
+      setRowState(row, result.detail || "no Whisper API found", "err");
+      return;
+    }
+    setRowState(row, `reachable · ${result.kind}`, "ok");
+    // Offer the models this server actually has, so the field is not guesswork.
+    if (result.models?.length) {
+      const listId = `models-${row.dataset.id || Math.random().toString(36).slice(2)}`;
+      let list = document.getElementById(listId);
+      if (!list) {
+        list = el("datalist");
+        list.id = listId;
+        document.body.append(list);
+      }
+      list.replaceChildren();
+      for (const model of result.models) {
+        const option = el("option");
+        option.value = model;
+        list.append(option);
+      }
+      const modelField = row.querySelector('[data-field="model"]');
+      modelField.setAttribute("list", listId);
+      if (!modelField.value && result.models.length === 1) {
+        modelField.value = result.models[0];
+        row.classList.add("dirty");
+      }
+    }
+  } catch (error) {
+    setRowState(row, error.message, "err");
+  }
+}
+
+async function saveRow(row) {
+  const payload = readRow(row);
+  if (!payload.name || !payload.url) {
+    setRowState(row, "name and URL are required", "err");
+    return;
+  }
+  // An untouched password box means "keep the stored key", so drop it.
+  if (!payload.apiKey) delete payload.apiKey;
+  setRowState(row, "saving…", "busy");
+  try {
+    if (row.dataset.id) {
+      await api(`/api/whisper/instances/${row.dataset.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+    } else {
+      await api("/api/whisper/instances", { method: "POST", body: JSON.stringify(payload) });
+    }
+    row.classList.remove("dirty");
+    toast(`Saved “${payload.name}”`, "ok");
+    await loadInstances();
+    await refreshWhisperStatus(true);
+  } catch (error) {
+    setRowState(row, error.message, "err");
+  }
+}
+
+async function deleteRow(row) {
+  const name = row.querySelector('[data-field="name"]').value || "this instance";
+  if (!row.dataset.id) {
+    row.remove();
+    return;
+  }
+  if (!confirm(`Remove ${name} from the pool?`)) return;
+  try {
+    await api(`/api/whisper/instances/${row.dataset.id}`, { method: "DELETE" });
+    toast(`Removed “${name}”`, "ok");
+    await loadInstances();
+    await refreshWhisperStatus(true);
+  } catch (error) {
+    setRowState(row, error.message, "err");
+  }
+}
+
+async function openInstances() {
+  await loadInstances();
+  if (!instancesDialog.open) instancesDialog.showModal();
+}
+
+$("open-instances").addEventListener("click", openInstances);
+$("instances-close").addEventListener("click", () => instancesDialog.close());
+$("instance-add").addEventListener("click", () => {
+  const row = buildRow(null);
+  $("instance-editor").append(row);
+  row.querySelector('[data-field="name"]').focus();
+});
+instancesDialog.addEventListener("close", () => refreshWhisperStatus());
+
+// --------------------------------------------------------------------------- //
 // wiring
 // --------------------------------------------------------------------------- //
 
 $("reload-cameras").addEventListener("click", loadCameras);
-$("pill-whisper").addEventListener("click", () => refreshWhisperStatus(true));
+$("pill-whisper").addEventListener("click", async () => {
+  const states = await refreshWhisperStatus(true);
+  // Nothing healthy? The fix is almost always in the instance settings.
+  if (states && states.healthy === 0) openInstances();
+});
 $("pill-protect").addEventListener("click", refreshProtectStatus);
 $("camera-filter").addEventListener("input", (event) => {
   state.cameraFilter = event.target.value;

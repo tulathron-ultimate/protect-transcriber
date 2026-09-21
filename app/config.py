@@ -33,12 +33,25 @@ class WhisperInstance:
     model: str = "Systran/faster-whisper-base"
     concurrency: int = 1
     api_key: str = ""
+    # Off keeps the row in the UI but out of the pool -- handy while a container
+    # is down or being re-pulled, without losing its settings.
+    enabled: bool = True
     # Populated at runtime by the pool once probing settles.
     resolved_kind: BackendKind | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         self.url = self.url.rstrip("/")
         self.concurrency = max(1, int(self.concurrency))
+
+    def same_runtime(self, other: WhisperInstance) -> bool:
+        """Whether a reload can keep the live state (health, stats, semaphore)."""
+        return (
+            self.url == other.url
+            and self.kind == other.kind
+            and self.model == other.model
+            and self.concurrency == other.concurrency
+            and self.api_key == other.api_key
+        )
 
 
 def _parse_instances(raw: str) -> list[WhisperInstance]:

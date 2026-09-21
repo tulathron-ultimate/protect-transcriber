@@ -17,8 +17,10 @@
     Speaches, openai-whisper-asr-webservice, or whisper.cpp).
 
     Requires a LOCAL UniFi Protect account (Local Access Only, no 2FA) -- that is
-    what drives clip export. Set PROTECT_HOST, PROTECT_USERNAME, PROTECT_PASSWORD
-    and WHISPER_INSTANCES below, then open the WebUI.
+    what drives clip export. Set PROTECT_HOST, PROTECT_USERNAME and
+    PROTECT_PASSWORD below, then open the WebUI and add your Whisper containers
+    under Whisper -> Configure. Persistent data lives in
+    /mnt/user/appdata/protect-transcriber.
 
     Full setup guide: https://github.com/tulathron-ultimate/protect-transcriber/blob/main/docs/unraid-setup.md
   </Overview>
@@ -55,8 +57,8 @@
           Type="Variable" Display="always" Required="true" Mask="true"/>
 
   <Config Name="Whisper Instances" Target="WHISPER_INSTANCES" Default="" Mode=""
-          Description="Comma separated: [name=]url[|kind][|model][|concurrency]. kind is auto, openai, asr_webservice or whisper_cpp. Example: faster=http://192.168.1.50:8000|openai|Systran/faster-whisper-large-v3|2,asr=http://192.168.1.50:9000|asr_webservice"
-          Type="Variable" Display="always" Required="true" Mask="false"/>
+          Description="Optional starting point. Whisper instances are managed in the WebUI (sidebar -> Whisper -> Configure), where adding or editing one takes effect immediately without restarting the container. Anything set here is loaded once on first start so it appears in the UI ready to edit; after that the UI is the source of truth and this field is ignored. Format: [name=]url[|kind][|model][|concurrency], comma separated. kind is auto, openai, asr_webservice or whisper_cpp. Example: faster=http://192.168.1.50:8000|openai|Systran/faster-whisper-large-v3|2,asr=http://192.168.1.50:9000|asr_webservice"
+          Type="Variable" Display="always" Required="false" Mask="false"/>
 
   <Config Name="Protect API Key" Target="PROTECT_API_KEY" Default="" Mode=""
           Description="Optional. Used for the newer integration endpoints. Clip export still prefers the local account."

@@ -28,12 +28,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import media
-from .config import Settings, get_settings
+from .config import BackendKind, Settings, WhisperInstance, get_settings
 from .jobs import JobManager
 from .protect import ProtectAuthError, ProtectClient, ProtectError
-from .store import JobStore
+from .store import InstanceStore, JobStore
 from .transcript import Segment, to_srt, to_vtt, to_wallclock_text
-from .whisper import NoHealthyInstances, WhisperPool
+from .whisper import BACKENDS, NoHealthyInstances, OpenAIBackend, WhisperPool
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +61,88 @@ class JobRequest(BaseModel):
     def _aware(cls, value: datetime) -> datetime:
         # Treat a naive timestamp as UTC; the UI always sends an offset.
         return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+class InstanceCreate(BaseModel):
+    """A Whisper instance as the settings panel submits it."""
+
+    name: str = Field(min_length=1, max_length=64)
+    url: str = Field(min_length=1, max_length=500)
+    kind: BackendKind = "auto"
+    model: str = ""
+    concurrency: int = Field(default=1, ge=1, le=64)
+    api_key: str = Field(default="", alias="apiKey")
+    enabled: bool = True
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("url")
+    @classmethod
+    def _needs_a_scheme(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _tidy_name(cls, value: str) -> str:
+        return value.strip()
+
+
+class InstanceUpdate(BaseModel):
+    """Every field optional; omitted ones keep their stored value."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    url: str | None = Field(default=None, min_length=1, max_length=500)
+    kind: BackendKind | None = None
+    model: str | None = None
+    concurrency: int | None = Field(default=None, ge=1, le=64)
+    api_key: str | None = Field(default=None, alias="apiKey")
+    enabled: bool | None = None
+
+    model_config = {"populate_by_name": True}
+
+    _check_url = field_validator("url")(InstanceCreate._needs_a_scheme.__func__)
+
+
+class InstanceProbe(BaseModel):
+    """A candidate instance to test before saving it."""
+
+    url: str = Field(min_length=1)
+    kind: BackendKind = "auto"
+    api_key: str = Field(default="", alias="apiKey")
+
+    model_config = {"populate_by_name": True}
+
+    _check_url = field_validator("url")(InstanceCreate._needs_a_scheme.__func__)
+
+
+def _instance_from_row(row: dict[str, Any]) -> WhisperInstance:
+    return WhisperInstance(
+        name=row["name"],
+        url=row["url"],
+        kind=row["kind"],
+        model=row["model"],
+        concurrency=row["concurrency"],
+        api_key=row["api_key"],
+        enabled=bool(row["enabled"]),
+    )
+
+
+def _public_instance(row: dict[str, Any]) -> dict[str, Any]:
+    """Never return the API key itself -- only whether one is set."""
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "url": row["url"],
+        "kind": row["kind"],
+        "model": row["model"],
+        "concurrency": row["concurrency"],
+        "enabled": bool(row["enabled"]),
+        "hasApiKey": bool(row["api_key"]),
+        "position": row["position"],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -92,12 +174,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     store = JobStore(settings.db_path)
     await store.init()
-    pool = WhisperPool(settings)
+
+    instances = InstanceStore(settings.db_path)
+    # First start: lift whatever is in WHISPER_INSTANCES into the database so it
+    # shows up in the UI ready to edit. After that the database wins, or a
+    # restart would quietly undo edits made through the UI.
+    seeded = await instances.seed(
+        [
+            {
+                "name": inst.name,
+                "url": inst.url,
+                "kind": inst.kind,
+                "model": inst.model,
+                "concurrency": inst.concurrency,
+                "api_key": inst.api_key,
+            }
+            for inst in settings.instances
+        ]
+    )
+    if seeded:
+        log.info("Seeded %d Whisper instance(s) from WHISPER_INSTANCES", seeded)
+    rows = await instances.list()
+    pool = WhisperPool(settings, instances=[_instance_from_row(row) for row in rows])
     protect = ProtectClient(settings)
     manager = JobManager(settings, store, pool, protect)
     await manager.start()
 
     app.state.store = store
+    app.state.instances = instances
     app.state.pool = pool
     app.state.protect = protect
     app.state.manager = manager
@@ -105,8 +209,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     if not media.ffmpeg_available(settings.ffmpeg_path, settings.ffprobe_path):
         log.error("ffmpeg/ffprobe not found on PATH -- transcription will fail")
-    if not settings.instances:
-        log.warning("No Whisper instances configured; set WHISPER_INSTANCES")
+    if not pool.states:
+        log.warning(
+            "No Whisper instances configured. Add one in the UI under Whisper "
+            "instances, or set WHISPER_INSTANCES before first start."
+        )
     else:
         # Probe in the background so startup is not blocked by a sleeping container.
         asyncio.create_task(pool.probe_all(force=True))
@@ -205,6 +312,117 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "healthy": sum(1 for s in states if s.healthy),
             "capacity": pool.total_capacity,
         }
+
+    # -- Whisper instances (editable at runtime) ----------------------------
+
+    def get_instances() -> InstanceStore:
+        return app.state.instances
+
+    async def _reload_pool() -> None:
+        """Push the stored instances into the live pool and re-probe them."""
+        rows = await app.state.instances.list()
+        pool: WhisperPool = app.state.pool
+        pool.reload([_instance_from_row(row) for row in rows])
+        await pool.probe_all(force=True)
+
+    @app.get("/api/whisper/instances", dependencies=[Guard])
+    async def list_instances(store: InstanceStore = Depends(get_instances)) -> dict[str, Any]:
+        rows = await store.list()
+        # Merge in live health so the settings panel shows one coherent picture.
+        live = {state.instance.name: state.as_dict() for state in app.state.pool.states}
+        return {
+            "instances": [
+                _public_instance(row) | {"status": live.get(row["name"])} for row in rows
+            ],
+            "seededFrom": "WHISPER_INSTANCES" if settings.whisper_instances else None,
+        }
+
+    @app.post("/api/whisper/instances", status_code=201, dependencies=[Guard])
+    async def create_instance(
+        payload: InstanceCreate, store: InstanceStore = Depends(get_instances)
+    ) -> dict[str, Any]:
+        existing = await store.list()
+        if any(row["name"].lower() == payload.name.lower() for row in existing):
+            raise HTTPException(
+                status_code=409, detail=f"An instance named {payload.name!r} exists"
+            )
+        row = await store.add(
+            name=payload.name,
+            url=payload.url,
+            kind=payload.kind,
+            model=payload.model,
+            concurrency=payload.concurrency,
+            api_key=payload.api_key,
+            enabled=int(payload.enabled),
+        )
+        await _reload_pool()
+        return _public_instance(row)
+
+    @app.patch("/api/whisper/instances/{instance_id}", dependencies=[Guard])
+    async def update_instance(
+        instance_id: int,
+        payload: InstanceUpdate,
+        store: InstanceStore = Depends(get_instances),
+    ) -> dict[str, Any]:
+        if await store.get(instance_id) is None:
+            raise HTTPException(status_code=404, detail="No such instance")
+        # exclude_unset keeps an omitted api_key from wiping the stored one;
+        # sending "" explicitly still clears it.
+        fields = payload.model_dump(exclude_unset=True, exclude_none=True)
+        if "enabled" in fields:
+            fields["enabled"] = int(fields["enabled"])
+        if "name" in fields:
+            clash = [
+                row
+                for row in await store.list()
+                if row["name"].lower() == fields["name"].lower() and row["id"] != instance_id
+            ]
+            if clash:
+                raise HTTPException(status_code=409, detail="Another instance has that name")
+        row = await store.update(instance_id, **fields) if fields else await store.get(instance_id)
+        await _reload_pool()
+        return _public_instance(row)
+
+    @app.delete("/api/whisper/instances/{instance_id}", dependencies=[Guard])
+    async def delete_instance(
+        instance_id: int, store: InstanceStore = Depends(get_instances)
+    ) -> dict[str, Any]:
+        if not await store.delete(instance_id):
+            raise HTTPException(status_code=404, detail="No such instance")
+        await _reload_pool()
+        return {"deleted": instance_id}
+
+    @app.post("/api/whisper/instances/test", dependencies=[Guard])
+    async def test_instance(payload: InstanceProbe) -> dict[str, Any]:
+        """Probe a URL before saving it, and report which API answered."""
+        candidate = WhisperInstance(
+            name="probe", url=payload.url, kind=payload.kind, api_key=payload.api_key
+        )
+        order = (
+            ("openai", "asr_webservice", "whisper_cpp")
+            if payload.kind == "auto"
+            else (payload.kind,)
+        )
+        pool: WhisperPool = app.state.pool
+        errors: list[str] = []
+        for kind in order:
+            backend = BACKENDS[kind](candidate)
+            try:
+                ok = await backend.probe(pool.client)
+            except Exception as exc:  # noqa: BLE001 - any transport error is just "no"
+                errors.append(f"{kind}: {type(exc).__name__}")
+                continue
+            if not ok:
+                errors.append(f"{kind}: no match")
+                continue
+            models: list[str] = []
+            if kind == "openai":
+                try:
+                    models = await OpenAIBackend(candidate).models(pool.client)
+                except Exception:  # noqa: BLE001 - the model list is a convenience
+                    models = []
+            return {"reachable": True, "kind": kind, "models": models[:200]}
+        return {"reachable": False, "kind": None, "models": [], "detail": "; ".join(errors)}
 
     # -- Protect ------------------------------------------------------------
 

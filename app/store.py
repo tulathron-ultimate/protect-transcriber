@@ -56,6 +56,20 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 
+CREATE TABLE IF NOT EXISTS whisper_instances (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    url         TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'auto',
+    model       TEXT NOT NULL DEFAULT '',
+    concurrency INTEGER NOT NULL DEFAULT 1,
+    api_key     TEXT NOT NULL DEFAULT '',
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    position    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS job_search USING fts5(
     job_id UNINDEXED,
     title,
@@ -97,18 +111,22 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
+def _connect(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
 class JobStore:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = asyncio.Lock()
 
     def _connect(self) -> sqlite3.Connection:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self._path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        return _connect(self._path)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -285,3 +303,110 @@ class JobStore:
             return []
         cutoff = datetime.now(tz=UTC) - timedelta(days=retention_days)
         return await asyncio.to_thread(self._expired_sync, cutoff)
+
+
+class InstanceStore:
+    """Whisper instances, editable at runtime instead of only through the env.
+
+    ``WHISPER_INSTANCES`` seeds this table on first start so existing installs
+    keep working and their instances show up in the UI ready to edit. After that
+    the table is the source of truth and the environment variable is ignored --
+    otherwise a container restart would silently undo changes made in the UI.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = asyncio.Lock()
+
+    # -- reads --------------------------------------------------------------
+
+    def _list_sync(self) -> list[dict[str, Any]]:
+        with _connect(self._path) as conn:
+            rows = conn.execute("SELECT * FROM whisper_instances ORDER BY position, id").fetchall()
+        return [dict(row) for row in rows]
+
+    async def list(self) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_sync)
+
+    def _get_sync(self, instance_id: int) -> dict[str, Any] | None:
+        with _connect(self._path) as conn:
+            row = conn.execute(
+                "SELECT * FROM whisper_instances WHERE id = ?", (instance_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    async def get(self, instance_id: int) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_sync, instance_id)
+
+    # -- writes -------------------------------------------------------------
+
+    def _next_position_sync(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT COALESCE(MAX(position), -1) + 1 AS n FROM whisper_instances")
+        return int(row.fetchone()["n"])
+
+    def _add_sync(self, values: dict[str, Any]) -> dict[str, Any]:
+        now = _now()
+        with _connect(self._path) as conn:
+            values.setdefault("position", self._next_position_sync(conn))
+            cursor = conn.execute(
+                "INSERT INTO whisper_instances "
+                "(name, url, kind, model, concurrency, api_key, enabled, position, "
+                " created_at, updated_at) "
+                "VALUES (:name, :url, :kind, :model, :concurrency, :api_key, :enabled, "
+                ":position, :created_at, :updated_at)",
+                {**values, "created_at": now, "updated_at": now},
+            )
+            row = conn.execute(
+                "SELECT * FROM whisper_instances WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+        return dict(row)
+
+    async def add(self, **values: Any) -> dict[str, Any]:
+        async with self._lock:
+            return await asyncio.to_thread(self._add_sync, values)
+
+    def _update_sync(self, instance_id: int, fields: dict[str, Any]) -> dict[str, Any] | None:
+        payload = {**fields, "updated_at": _now()}
+        assignments = ", ".join(f"{key} = :{key}" for key in payload)
+        payload["id"] = instance_id
+        with _connect(self._path) as conn:
+            conn.execute(f"UPDATE whisper_instances SET {assignments} WHERE id = :id", payload)
+            row = conn.execute(
+                "SELECT * FROM whisper_instances WHERE id = ?", (instance_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    async def update(self, instance_id: int, **fields: Any) -> dict[str, Any] | None:
+        async with self._lock:
+            return await asyncio.to_thread(self._update_sync, instance_id, fields)
+
+    def _delete_sync(self, instance_id: int) -> bool:
+        with _connect(self._path) as conn:
+            cursor = conn.execute("DELETE FROM whisper_instances WHERE id = ?", (instance_id,))
+        return cursor.rowcount > 0
+
+    async def delete(self, instance_id: int) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(self._delete_sync, instance_id)
+
+    def _seed_sync(self, rows: list[dict[str, Any]]) -> int:
+        now = _now()
+        with _connect(self._path) as conn:
+            existing = conn.execute("SELECT COUNT(*) AS n FROM whisper_instances").fetchone()["n"]
+            if existing:
+                return 0
+            for position, values in enumerate(rows):
+                conn.execute(
+                    "INSERT INTO whisper_instances "
+                    "(name, url, kind, model, concurrency, api_key, enabled, position, "
+                    " created_at, updated_at) "
+                    "VALUES (:name, :url, :kind, :model, :concurrency, :api_key, 1, :position, "
+                    ":created_at, :updated_at)",
+                    {**values, "position": position, "created_at": now, "updated_at": now},
+                )
+        return len(rows)
+
+    async def seed(self, rows: list[dict[str, Any]]) -> int:
+        """Insert ``rows`` only when the table is empty. Returns how many landed."""
+        async with self._lock:
+            return await asyncio.to_thread(self._seed_sync, rows)

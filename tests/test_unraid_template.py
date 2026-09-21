@@ -53,9 +53,19 @@ def test_every_variable_maps_to_a_real_setting(template: ET.Element):
 
 def test_required_settings_are_present_and_marked_required(template: ET.Element):
     variables = {c.get("Target"): c for c in _configs(template, "Variable")}
-    for name in ("PROTECT_HOST", "PROTECT_USERNAME", "PROTECT_PASSWORD", "WHISPER_INSTANCES"):
+    # Protect credentials have no in-app equivalent, so they must be set up front.
+    for name in ("PROTECT_HOST", "PROTECT_USERNAME", "PROTECT_PASSWORD"):
         assert name in variables, f"{name} must be in the template; the app cannot work without it"
         assert variables[name].get("Required") == "true", f"{name} should be marked required"
+
+
+def test_whisper_instances_is_optional_because_the_ui_manages_them(template: ET.Element):
+    """Instances are editable at runtime, so the env var is only a seed."""
+    variables = {c.get("Target"): c for c in _configs(template, "Variable")}
+    assert "WHISPER_INSTANCES" in variables
+    config = variables["WHISPER_INSTANCES"]
+    assert config.get("Required") == "false"
+    assert "WebUI" in (config.get("Description") or "")
 
 
 def test_secrets_are_masked(template: ET.Element):
@@ -91,7 +101,15 @@ def test_data_path_matches_the_container_default(template: ET.Element, dockerfil
     assert path.get("Mode") == "rw", "clips and the database need write access"
     assert "DATA_DIR=/data" in dockerfile
     assert Settings(_env_file=None).data_dir.as_posix() == "/data"
-    assert "appdata" in (path.text or ""), "default host path should live in appdata"
+
+
+def test_host_path_follows_the_unraid_appdata_convention(template: ET.Element):
+    """Persistent data belongs at /mnt/user/appdata/<container-name>."""
+    name = template.findtext("Name", "")
+    expected = f"/mnt/user/appdata/{name}"
+    path = next(c for c in _configs(template, "Path") if c.get("Target") == "/data")
+    assert path.get("Default") == expected
+    assert (path.text or "").strip() == expected, "the element value is what Unraid pre-fills"
 
 
 def test_image_is_pullable_rather_than_built_locally(template: ET.Element):

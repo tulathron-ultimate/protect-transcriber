@@ -37,6 +37,10 @@
       <ul class="camera-list" id="camera-list">
         <li class="empty">Loading…</li>
       </ul>
+      <div class="instances-head">
+        <h2>Whisper</h2>
+        <button class="ghost" id="open-instances" type="button" title="Configure Whisper instances">Configure</button>
+      </div>
       <div class="instances" id="instance-list"></div>
     </aside>
 
@@ -137,6 +141,64 @@
       <ol class="segments" id="viewer-segments"></ol>
     </div>
   </dialog>
+
+  <!-- whisper instance settings ------------------------------------------- -->
+  <dialog class="viewer instances-dialog" id="instances-dialog">
+    <div class="viewer-head">
+      <div>
+        <h3>Whisper instances</h3>
+        <p class="viewer-meta">Saved here, not in the container's environment — changes apply immediately, no restart.</p>
+      </div>
+      <button class="ghost close" id="instances-close" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="viewer-body">
+      <ul class="instance-editor" id="instance-editor"></ul>
+      <div class="instance-actions">
+        <button class="ghost" id="instance-add" type="button">+ Add instance</button>
+        <span class="hint" id="instance-hint"></span>
+      </div>
+    </div>
+  </dialog>
+
+  <template id="instance-row-template">
+    <li class="instance-row">
+      <div class="instance-grid">
+        <label class="f-name">Name
+          <input type="text" data-field="name" placeholder="faster" maxlength="64" />
+        </label>
+        <label class="f-url">URL
+          <input type="url" data-field="url" placeholder="http://192.168.1.50:8000" />
+        </label>
+        <label class="f-kind">API
+          <select data-field="kind">
+            <option value="auto">Auto-detect</option>
+            <option value="openai">OpenAI-compatible</option>
+            <option value="asr_webservice">asr-webservice</option>
+            <option value="whisper_cpp">whisper.cpp</option>
+          </select>
+        </label>
+        <label class="f-model">Model
+          <input type="text" data-field="model" list="" placeholder="Systran/faster-whisper-base" />
+        </label>
+        <label class="f-parallel">Parallel
+          <input type="number" data-field="concurrency" min="1" max="64" step="1" />
+        </label>
+        <label class="f-key">API key
+          <input type="password" data-field="apiKey" placeholder="none" autocomplete="off" />
+        </label>
+      </div>
+      <div class="instance-row-foot">
+        <label class="toggle">
+          <input type="checkbox" data-field="enabled" /> Enabled
+        </label>
+        <span class="instance-state" data-role="state"></span>
+        <div class="spacer"></div>
+        <button class="ghost" type="button" data-action="test">Test</button>
+        <button class="ghost" type="button" data-action="save">Save</button>
+        <button class="ghost danger" type="button" data-action="delete">Delete</button>
+      </div>
+    </li>
+  </template>
 
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
   <script src="/static/app.js"></script>
