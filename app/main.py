@@ -1,0 +1,524 @@
+"""FastAPI application: REST API plus the single-page web UI."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import secrets
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, Literal
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
+
+from . import media
+from .config import Settings, get_settings
+from .jobs import JobManager
+from .protect import ProtectAuthError, ProtectClient, ProtectError
+from .store import JobStore
+from .transcript import Segment, to_srt, to_vtt, to_wallclock_text
+from .whisper import NoHealthyInstances, WhisperPool
+
+log = logging.getLogger(__name__)
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+# --------------------------------------------------------------------------- #
+# request/response models
+# --------------------------------------------------------------------------- #
+
+
+class JobRequest(BaseModel):
+    camera_id: str = Field(alias="cameraId", min_length=1)
+    start: datetime
+    end: datetime
+    title: str = ""
+    language: str | None = None
+    task: Literal["transcribe", "translate"] = "transcribe"
+    prompt: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("start", "end")
+    @classmethod
+    def _aware(cls, value: datetime) -> datetime:
+        # Treat a naive timestamp as UTC; the UI always sends an offset.
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+# --------------------------------------------------------------------------- #
+# app wiring
+# --------------------------------------------------------------------------- #
+
+
+def _configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+
+
+async def _retention_loop(manager: JobManager) -> None:
+    while True:
+        try:
+            await manager.cleanup_expired()
+        except Exception:  # pragma: no cover - never kill the loop
+            log.exception("Retention sweep failed")
+        await asyncio.sleep(6 * 3600)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings: Settings = app.state.settings
+    _configure_logging(settings.log_level)
+    settings.ensure_dirs()
+
+    store = JobStore(settings.db_path)
+    await store.init()
+    pool = WhisperPool(settings)
+    protect = ProtectClient(settings)
+    manager = JobManager(settings, store, pool, protect)
+    await manager.start()
+
+    app.state.store = store
+    app.state.pool = pool
+    app.state.protect = protect
+    app.state.manager = manager
+    app.state.retention_task = asyncio.create_task(_retention_loop(manager))
+
+    if not media.ffmpeg_available(settings.ffmpeg_path, settings.ffprobe_path):
+        log.error("ffmpeg/ffprobe not found on PATH -- transcription will fail")
+    if not settings.instances:
+        log.warning("No Whisper instances configured; set WHISPER_INSTANCES")
+    else:
+        # Probe in the background so startup is not blocked by a sleeping container.
+        asyncio.create_task(pool.probe_all(force=True))
+
+    try:
+        yield
+    finally:
+        app.state.retention_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await app.state.retention_task
+        await manager.stop()
+        await pool.aclose()
+        await protect.aclose()
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    app = FastAPI(
+        title="protect-transcriber",
+        version="0.1.0",
+        description=(
+            "Pick a camera and a time range in UniFi Protect, get a transcript back "
+            "from your own Whisper containers."
+        ),
+        lifespan=lifespan,
+    )
+    app.state.settings = settings
+
+    def require_token(request: Request) -> None:
+        """Optional shared-secret gate (APP_TOKEN)."""
+        expected = settings.app_token
+        if not expected:
+            return
+        supplied = (
+            request.headers.get("X-App-Token")
+            or request.query_params.get("token")
+            or request.cookies.get("pt_token")
+            or ""
+        )
+        header = request.headers.get("Authorization", "")
+        if not supplied and header.lower().startswith("bearer "):
+            supplied = header[7:]
+        if not secrets.compare_digest(supplied, expected):
+            raise HTTPException(status_code=401, detail="Invalid or missing app token")
+
+    # Applied per route via `dependencies=[Guard]`; /api/health and / stay open so
+    # Docker/Unraid health checks work without the token.
+    Guard = Depends(require_token)
+
+    def get_manager() -> JobManager:
+        return app.state.manager
+
+    def get_store() -> JobStore:
+        return app.state.store
+
+    def get_pool() -> WhisperPool:
+        return app.state.pool
+
+    def get_protect() -> ProtectClient:
+        return app.state.protect
+
+    # -- meta ---------------------------------------------------------------
+
+    @app.get("/api/health")
+    async def health() -> dict[str, Any]:
+        pool: WhisperPool = app.state.pool
+        return {
+            "status": "ok",
+            "configured": settings.configured(),
+            "ffmpeg": media.ffmpeg_available(settings.ffmpeg_path, settings.ffprobe_path),
+            "protectHost": settings.protect_host or None,
+            "whisperInstances": len(pool.states),
+            "authRequired": bool(settings.app_token),
+        }
+
+    @app.get("/api/config", dependencies=[Guard])
+    async def config() -> dict[str, Any]:
+        """Non-secret settings the UI needs to render itself."""
+        return {
+            "protectHost": settings.protect_host,
+            "maxRangeSeconds": settings.max_range_seconds,
+            "chunkSeconds": settings.chunk_seconds,
+            "defaultLanguage": settings.whisper_language,
+            "defaultTask": settings.whisper_task,
+            "keepClips": settings.keep_clips,
+            "retentionDays": settings.retention_days,
+        }
+
+    @app.get("/api/whisper", dependencies=[Guard])
+    async def whisper_status(
+        refresh: bool = False, pool: WhisperPool = Depends(get_pool)
+    ) -> dict[str, Any]:
+        states = await pool.probe_all(force=refresh)
+        return {
+            "instances": [state.as_dict() for state in states],
+            "healthy": sum(1 for s in states if s.healthy),
+            "capacity": pool.total_capacity,
+        }
+
+    # -- Protect ------------------------------------------------------------
+
+    @app.get("/api/protect", dependencies=[Guard])
+    async def protect_info(client: ProtectClient = Depends(get_protect)) -> dict[str, Any]:
+        try:
+            return {"connected": True, "nvr": await client.nvr_info()}
+        except (ProtectError, ProtectAuthError) as exc:
+            return {"connected": False, "error": str(exc)}
+
+    @app.get("/api/cameras", dependencies=[Guard])
+    async def cameras(client: ProtectClient = Depends(get_protect)) -> dict[str, Any]:
+        try:
+            found = await client.cameras()
+        except ProtectAuthError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ProtectError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"cameras": [camera.as_dict() for camera in found]}
+
+    @app.get("/api/cameras/{camera_id}/events", dependencies=[Guard])
+    async def camera_events(
+        camera_id: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        client: ProtectClient = Depends(get_protect),
+    ) -> dict[str, Any]:
+        end = end or datetime.now(tz=UTC)
+        start = start or (end - timedelta(hours=24))
+        events = await client.events(start, end, camera_id=camera_id)
+        return {"events": [event.as_dict() for event in events]}
+
+    @app.get("/api/cameras/{camera_id}/snapshot", dependencies=[Guard])
+    async def camera_snapshot(
+        camera_id: str, client: ProtectClient = Depends(get_protect)
+    ) -> Response:
+        try:
+            payload = await client.snapshot(camera_id)
+        except ProtectError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return Response(
+            content=payload,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "max-age=30"},
+        )
+
+    # -- jobs ---------------------------------------------------------------
+
+    @app.post("/api/jobs", status_code=202, dependencies=[Guard])
+    async def create_job(
+        payload: JobRequest,
+        manager: JobManager = Depends(get_manager),
+        client: ProtectClient = Depends(get_protect),
+    ) -> dict[str, Any]:
+        span = (payload.end - payload.start).total_seconds()
+        if span <= 0:
+            raise HTTPException(status_code=400, detail="End must be after start")
+        if span > settings.max_range_seconds:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Range is {span / 60:.0f} min; the limit is "
+                    f"{settings.max_range_seconds / 60:.0f} min (raise MAX_RANGE_SECONDS)"
+                ),
+            )
+        if payload.start > datetime.now(tz=UTC):
+            raise HTTPException(status_code=400, detail="Start is in the future")
+
+        camera_name = payload.camera_id
+        try:
+            camera = await client.camera(payload.camera_id)
+            camera_name = camera.name
+            if not camera.has_audio:
+                log.warning(
+                    "Camera %s reports no usable mic; the clip may have no audio track", camera.name
+                )
+        except ProtectError as exc:
+            # Don't block the job on a metadata hiccup -- the export is the real test.
+            log.warning("Could not look up camera %s: %s", payload.camera_id, exc)
+
+        return await manager.submit(
+            camera_id=payload.camera_id,
+            camera_name=camera_name,
+            range_start=payload.start,
+            range_end=payload.end,
+            title=payload.title or f"{camera_name} {payload.start:%Y-%m-%d %H:%M}",
+            language=payload.language or settings.whisper_language or None,
+            task=payload.task,
+            prompt=payload.prompt,
+        )
+
+    @app.post("/api/jobs/upload", status_code=202, dependencies=[Guard])
+    async def upload_job(
+        file: UploadFile = File(...),
+        title: str = Form(""),
+        language: str = Form(""),
+        task: str = Form("transcribe"),
+        prompt: str = Form(""),
+        manager: JobManager = Depends(get_manager),
+    ) -> dict[str, Any]:
+        """Transcribe an already-downloaded clip -- handy for testing the pool."""
+        safe_name = Path(file.filename or "upload.mp4").name
+        destination = settings.clips_dir / f"upload-{secrets.token_hex(4)}-{safe_name}"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        size = 0
+        with destination.open("wb") as handle:
+            while block := await file.read(1 << 20):
+                size += len(block)
+                handle.write(block)
+        if size == 0:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        return await manager.submit(
+            title=title or safe_name,
+            language=language or settings.whisper_language or None,
+            task=task if task in ("transcribe", "translate") else "transcribe",
+            prompt=prompt or None,
+            source="upload",
+            upload_path=destination,
+        )
+
+    @app.get("/api/jobs", dependencies=[Guard])
+    async def list_jobs(
+        status: str | None = None,
+        camera_id: str | None = Query(default=None, alias="cameraId"),
+        limit: int = Query(default=50, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        store: JobStore = Depends(get_store),
+    ) -> dict[str, Any]:
+        jobs = await store.list(status=status, limit=limit, offset=offset, camera_id=camera_id)
+        return {"jobs": [_public_job(job) for job in jobs], "stats": await store.stats()}
+
+    @app.get("/api/jobs/search", dependencies=[Guard])
+    async def search_jobs(
+        q: str = Query(min_length=1),
+        limit: int = Query(default=50, ge=1, le=200),
+        store: JobStore = Depends(get_store),
+    ) -> dict[str, Any]:
+        results = await store.search(q, limit=limit)
+        return {
+            "query": q,
+            "results": [_public_job(job) | {"snippet": job.get("snippet", "")} for job in results],
+        }
+
+    @app.get("/api/jobs/stream", dependencies=[Guard])
+    async def stream_jobs(manager: JobManager = Depends(get_manager)) -> StreamingResponse:
+        """Server-sent events carrying every job state change."""
+
+        async def generator() -> AsyncIterator[bytes]:
+            async with manager.events.subscribe() as queue:
+                yield b": connected\n\n"
+                while True:
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=20.0)
+                    except TimeoutError:
+                        yield b": keepalive\n\n"  # keeps proxies from closing the stream
+                        continue
+                    if "job" in event:
+                        event = {**event, "job": _public_job(event["job"])}
+                    yield f"data: {json.dumps(event)}\n\n".encode()
+
+        return StreamingResponse(
+            generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/jobs/{job_id}", dependencies=[Guard])
+    async def get_job(job_id: str, store: JobStore = Depends(get_store)) -> dict[str, Any]:
+        job = await store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such job")
+        return _public_job(job, include_segments=True)
+
+    @app.post("/api/jobs/{job_id}/cancel", dependencies=[Guard])
+    async def cancel_job(job_id: str, manager: JobManager = Depends(get_manager)) -> dict[str, Any]:
+        if not await manager.cancel(job_id):
+            raise HTTPException(status_code=409, detail="Job is not running")
+        return {"canceled": job_id}
+
+    @app.post("/api/jobs/{job_id}/retry", status_code=202, dependencies=[Guard])
+    async def retry_job(job_id: str, manager: JobManager = Depends(get_manager)) -> dict[str, Any]:
+        try:
+            job = await manager.retry(job_id)
+        except ProtectError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such job")
+        return _public_job(job)
+
+    @app.delete("/api/jobs/{job_id}", dependencies=[Guard])
+    async def delete_job(job_id: str, manager: JobManager = Depends(get_manager)) -> dict[str, Any]:
+        if not await manager.purge(job_id):
+            raise HTTPException(status_code=404, detail="No such job")
+        return {"deleted": job_id}
+
+    # -- downloads ----------------------------------------------------------
+
+    @app.get("/api/jobs/{job_id}/transcript.{fmt}", dependencies=[Guard])
+    async def download_transcript(
+        job_id: str, fmt: str, store: JobStore = Depends(get_store)
+    ) -> Response:
+        job = await store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such job")
+        segments = [
+            Segment(start=s.get("start", 0.0), end=s.get("end", 0.0), text=s.get("text", ""))
+            for s in job["segments"]
+        ]
+        slug = _slug(job["title"] or job_id)
+        if fmt == "txt":
+            body, mime = (job["text"] or "") + "\n", "text/plain"
+        elif fmt == "srt":
+            body, mime = to_srt(segments), "application/x-subrip"
+        elif fmt == "vtt":
+            body, mime = to_vtt(segments), "text/vtt"
+        elif fmt == "log":
+            start = job["range_start"]
+            if not start:
+                raise HTTPException(status_code=400, detail="Job has no wall-clock start")
+            body = to_wallclock_text(segments, datetime.fromisoformat(start))
+            mime = "text/plain"
+        elif fmt == "json":
+            body = json.dumps(_public_job(job, include_segments=True), indent=2)
+            mime = "application/json"
+        else:
+            raise HTTPException(status_code=400, detail="Format must be txt, srt, vtt, log or json")
+        extension = "txt" if fmt == "log" else fmt
+        return Response(
+            content=body,
+            media_type=mime,
+            headers={"Content-Disposition": f'attachment; filename="{slug}.{extension}"'},
+        )
+
+    @app.get("/api/jobs/{job_id}/clip", dependencies=[Guard])
+    async def download_clip(job_id: str, store: JobStore = Depends(get_store)) -> FileResponse:
+        job = await store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such job")
+        path = Path(job["clip_path"]) if job["clip_path"] else None
+        if path is None or not path.exists():
+            raise HTTPException(
+                status_code=404, detail="Clip is not on disk (KEEP_CLIPS may be off)"
+            )
+        # FileResponse handles Range requests, so the UI's <video> can seek.
+        return FileResponse(path, media_type="video/mp4", filename=f"{_slug(job['title'])}.mp4")
+
+    @app.get("/api/jobs/{job_id}/audio", dependencies=[Guard])
+    async def download_audio(job_id: str, store: JobStore = Depends(get_store)) -> FileResponse:
+        job = await store.get(job_id)
+        if job is None or not job["audio_path"] or not Path(job["audio_path"]).exists():
+            raise HTTPException(status_code=404, detail="Audio is not on disk")
+        return FileResponse(job["audio_path"], media_type="audio/wav")
+
+    # -- UI -----------------------------------------------------------------
+
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index() -> Response:
+        page = STATIC_DIR / "index.html"
+        if not page.exists():  # pragma: no cover
+            return PlainTextResponse("UI assets are missing from the image", status_code=500)
+        return HTMLResponse(page.read_text(encoding="utf-8"))
+
+    @app.exception_handler(NoHealthyInstances)
+    async def _no_instances(_: Request, exc: NoHealthyInstances) -> Response:
+        return Response(
+            content=json.dumps({"detail": str(exc)}), status_code=503, media_type="application/json"
+        )
+
+    return app
+
+
+def _slug(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_ ." else "-" for ch in value).strip()
+    return ("-".join(cleaned.split()) or "transcript")[:80]
+
+
+def _public_job(job: dict[str, Any], include_segments: bool = False) -> dict[str, Any]:
+    """Map a DB row to the camelCase shape the UI consumes."""
+    payload = {
+        "id": job["id"],
+        "status": job["status"],
+        "stage": job["stage"],
+        "progress": round(float(job["progress"] or 0.0), 4),
+        "title": job["title"],
+        "cameraId": job["camera_id"],
+        "cameraName": job["camera_name"],
+        "rangeStart": job["range_start"],
+        "rangeEnd": job["range_end"],
+        "source": job["source"],
+        "language": job["language"],
+        "detectedLanguage": job["detected_language"],
+        "task": job["task"],
+        "audioSeconds": job["audio_seconds"],
+        "clipBytes": job["clip_bytes"],
+        "chunkCount": job["chunk_count"],
+        "chunksDone": job["chunks_done"],
+        "instances": job["instances"],
+        "error": job["error"],
+        "createdAt": job["created_at"],
+        "startedAt": job["started_at"],
+        "finishedAt": job["finished_at"],
+        "hasClip": bool(job["clip_path"]),
+        "textLength": len(job["text"] or ""),
+    }
+    if include_segments:
+        payload["text"] = job["text"]
+        payload["segments"] = job["segments"]
+    else:
+        payload["preview"] = (job["text"] or "")[:280]
+    return payload
+
+
+app = create_app()

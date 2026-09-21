@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Protect Transcriber</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">🎙️</span>
+      <div>
+        <h1>Protect Transcriber</h1>
+        <p class="tagline">Pick a camera and a time range — get the words back.</p>
+      </div>
+    </div>
+    <div class="status-pills">
+      <button class="pill" id="pill-protect" type="button" title="UniFi Protect connection">
+        <span class="dot"></span><span class="label">Protect</span>
+      </button>
+      <button class="pill" id="pill-whisper" type="button" title="Click to re-probe Whisper instances">
+        <span class="dot"></span><span class="label">Whisper</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- cameras ------------------------------------------------------------ -->
+    <aside class="panel cameras">
+      <div class="panel-head">
+        <h2>Cameras</h2>
+        <button class="ghost" id="reload-cameras" type="button" title="Reload camera list">↻</button>
+      </div>
+      <input class="filter" id="camera-filter" type="search" placeholder="Filter cameras…" aria-label="Filter cameras" />
+      <ul class="camera-list" id="camera-list">
+        <li class="empty">Loading…</li>
+      </ul>
+      <div class="instances" id="instance-list"></div>
+    </aside>
+
+    <!-- selection ---------------------------------------------------------- -->
+    <section class="panel selection">
+      <div class="panel-head">
+        <h2 id="selection-title">Select a time range</h2>
+        <div class="day-nav">
+          <button class="ghost" id="day-prev" type="button" aria-label="Previous day">‹</button>
+          <input type="date" id="day-picker" aria-label="Day" />
+          <button class="ghost" id="day-next" type="button" aria-label="Next day">›</button>
+        </div>
+      </div>
+
+      <div class="timeline-wrap">
+        <canvas id="timeline" height="96" aria-label="Timeline: drag to select a range"></canvas>
+        <p class="timeline-hint">Drag across the timeline to select. Marks show Protect events (motion, person, vehicle, ring).</p>
+      </div>
+
+      <div class="range-grid">
+        <label>Start
+          <input type="datetime-local" id="range-start" step="1" />
+        </label>
+        <label>End
+          <input type="datetime-local" id="range-end" step="1" />
+        </label>
+        <div class="duration">
+          <span class="duration-value" id="range-duration">—</span>
+          <span class="duration-label">selected</span>
+        </div>
+      </div>
+
+      <div class="presets" id="presets">
+        <span class="presets-label">Quick:</span>
+        <button type="button" data-minutes="5">last 5 min</button>
+        <button type="button" data-minutes="15">last 15 min</button>
+        <button type="button" data-minutes="60">last hour</button>
+      </div>
+
+      <details class="options">
+        <summary>Transcription options</summary>
+        <div class="options-grid">
+          <label>Title
+            <input type="text" id="opt-title" placeholder="Auto from camera + time" />
+          </label>
+          <label>Language
+            <input type="text" id="opt-language" placeholder="auto-detect (e.g. en)" maxlength="8" />
+          </label>
+          <label>Mode
+            <select id="opt-task">
+              <option value="transcribe">Transcribe</option>
+              <option value="translate">Translate to English</option>
+            </select>
+          </label>
+          <label class="wide">Prompt hint <small>names, jargon, or context to bias Whisper</small>
+            <input type="text" id="opt-prompt" placeholder="e.g. Amazon, UPS, driveway, Tulathron" />
+          </label>
+        </div>
+      </details>
+
+      <div class="actions">
+        <button class="primary" id="submit-job" type="button" disabled>Transcribe selection</button>
+        <label class="upload-btn">
+          Upload a clip instead
+          <input type="file" id="upload-input" accept="video/*,audio/*" hidden />
+        </label>
+      </div>
+      <p class="form-error" id="form-error" hidden></p>
+    </section>
+
+    <!-- jobs --------------------------------------------------------------- -->
+    <section class="panel jobs">
+      <div class="panel-head">
+        <h2>Transcripts</h2>
+        <input class="filter" id="job-search" type="search" placeholder="Search all transcripts…" aria-label="Search transcripts" />
+      </div>
+      <ul class="job-list" id="job-list">
+        <li class="empty">No transcripts yet.</li>
+      </ul>
+    </section>
+  </main>
+
+  <!-- transcript viewer ---------------------------------------------------- -->
+  <dialog class="viewer" id="viewer">
+    <div class="viewer-head">
+      <div>
+        <h3 id="viewer-title">Transcript</h3>
+        <p class="viewer-meta" id="viewer-meta"></p>
+      </div>
+      <button class="ghost close" id="viewer-close" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="viewer-body">
+      <video id="viewer-video" controls preload="metadata" playsinline></video>
+      <div class="viewer-tools">
+        <input class="filter" id="viewer-find" type="search" placeholder="Find in transcript…" aria-label="Find in transcript" />
+        <div class="downloads" id="viewer-downloads"></div>
+      </div>
+      <ol class="segments" id="viewer-segments"></ol>
+    </div>
+  </dialog>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

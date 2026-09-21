@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Maintainer>
+  <Icon>https://raw.githubusercontent.com/tulathron-ultimate/protect-transcriber/main/unraid/icon.png</Icon>
+  <Profile>
+    Self-hosted tooling for UniFi Protect and Unraid. protect-transcriber turns a
+    selected camera and time range into a searchable transcript using your own
+    Whisper containers -- nothing leaves the LAN.
+  </Profile>
+  <WebPage>https://github.com/tulathron-ultimate/protect-transcriber</WebPage>
+</Maintainer>

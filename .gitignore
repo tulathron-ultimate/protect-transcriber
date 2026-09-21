@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime data (clips, audio, transcripts, sqlite db)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local config — never commit real credentials
+.env
+.env.local
+docker-compose.override.yml
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
