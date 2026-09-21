@@ -58,10 +58,15 @@ Key env vars (full list in `.env.example`):
 PROTECT_HOST=192.168.1.1
 PROTECT_USERNAME=transcriber        # LOCAL account, no 2FA
 PROTECT_PASSWORD=...
-WHISPER_INSTANCES=faster=http://192.168.1.50:8000|openai|Systran/faster-whisper-large-v3|2,asr=http://192.168.1.50:9000|asr_webservice
 CHUNK_SECONDS=300
 RETENTION_DAYS=30
 ```
+
+Whisper instances are **not** env config any more — they live in the database and
+are edited in the UI (sidebar → Whisper → Configure) with no restart.
+`WHISPER_INSTANCES` seeds the table once on first start, then is ignored.
+
+Appdata: `/mnt/user/appdata/protect-transcriber` (the template default).
 
 ## Findings worth keeping
 
@@ -108,6 +113,25 @@ These are the things that cost time to work out.
   measurably improves spelling of proper nouns.
 - **Pre-resampling to mono 16 kHz PCM** in this service rather than letting each
   container decode saves a step and keeps chunk offsets exact.
+
+### Runtime config vs env config
+
+- **Anything a user will tune belongs in the database, not the environment.** On
+  Unraid, changing an env var means editing the container template and
+  restarting it — far too heavy for "the Whisper box moved to a new port".
+- **Seed-once pattern** keeps both worlds working: read the env var only when
+  the table is empty, then treat the database as the source of truth. A restart
+  cannot silently undo a UI edit, and existing installs migrate with no action.
+  Log the seeding so it is visible in the container log.
+- **Hot-reload needs care with in-flight work.** Rebuild pool state only when
+  connection settings actually changed; otherwise keep the existing object so
+  health, throughput history and the semaphore survive. A running task holds its
+  own reference to the state it picked, so a removed instance still finishes.
+- **Concurrency changes must rebuild** the state, because `asyncio.Semaphore` is
+  sized at construction and cannot be resized.
+- **Never return a stored secret to the browser.** Send `hasApiKey: true`
+  instead, and treat an omitted key on PATCH as "keep", an explicit `""` as
+  "clear" (`model_dump(exclude_unset=True)` in pydantic v2 makes this exact).
 
 ### Unraid templates and GHCR
 

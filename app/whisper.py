@@ -361,7 +361,12 @@ class InstanceState:
 class WhisperPool:
     """Dispatches chunks across instances, respecting each one's concurrency."""
 
-    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: httpx.AsyncClient | None = None,
+        instances: list[WhisperInstance] | None = None,
+    ) -> None:
         self._settings = settings
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
@@ -369,14 +374,53 @@ class WhisperPool:
                 30.0, read=settings.whisper_timeout, write=settings.whisper_timeout
             )
         )
+        # `instances` comes from the database when the app runs; falling back to
+        # the parsed env keeps the pool usable on its own (and in tests).
         self.states: list[InstanceState] = [
-            InstanceState(instance=inst) for inst in settings.instances
+            InstanceState(instance=inst)
+            for inst in (settings.instances if instances is None else instances)
+            if inst.enabled
         ]
         self._probe_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        """The shared HTTP client, so callers can probe without a second pool."""
+        return self._client
+
+    def reload(self, instances: list[WhisperInstance]) -> list[InstanceState]:
+        """Swap in a new set of instances without disturbing in-flight work.
+
+        An instance whose connection settings are unchanged keeps its existing
+        state, so health, throughput history and its semaphore survive an edit to
+        an unrelated row. A task already running holds its own reference to the
+        state object it picked, so a removed or rebuilt instance still finishes
+        cleanly -- it just stops receiving new chunks.
+        """
+        by_name = {state.instance.name: state for state in self.states}
+        rebuilt: list[InstanceState] = []
+        for instance in instances:
+            if not instance.enabled:
+                continue
+            existing = by_name.get(instance.name)
+            if existing is not None and existing.instance.same_runtime(instance):
+                # Carry the resolved backend kind across so no re-probe is needed.
+                instance.resolved_kind = existing.instance.resolved_kind
+                existing.instance = instance
+                rebuilt.append(existing)
+            else:
+                rebuilt.append(InstanceState(instance=instance))
+        self.states = rebuilt
+        log.info(
+            "Whisper pool reloaded: %d instance(s) -- %s",
+            len(rebuilt),
+            ", ".join(state.instance.name for state in rebuilt) or "none",
+        )
+        return self.states
 
     @property
     def total_capacity(self) -> int:

@@ -58,7 +58,12 @@ field. Four values are yours to supply:
 | `PROTECT_HOST` | `192.168.1.1` | UDM / Cloud Key / NVR. IP or hostname, **no** `https://` |
 | `PROTECT_USERNAME` | `transcriber` | A local Protect account — see step 4 |
 | `PROTECT_PASSWORD` | … | Masked in the UI |
-| `WHISPER_INSTANCES` | see step 3 | Your Whisper container URLs |
+
+Whisper instances are **not** set here — you add them in the web UI, where
+changes take effect without restarting the container. See step 3.
+
+The `/data` mapping defaults to `/mnt/user/appdata/protect-transcriber`, the
+usual Unraid convention; leave it unless you keep appdata elsewhere.
 
 Click **Apply**, wait for the pull, then click the container icon → **WebUI**
 (or browse to `http://TOWER-IP:8099`).
@@ -69,7 +74,18 @@ size, retention, `APP_TOKEN` — are described inline and in
 
 ---
 
-## 3. Work out your Whisper URLs
+## 3. Add your Whisper instances
+
+Open the WebUI and use the sidebar: **Whisper → Configure**. Each row is one
+container — name, URL, API type, model, and how many requests it handles at
+once. **Test** probes the URL and reports which API answered; **Save** applies it
+to the running pool straight away, no restart.
+
+Instances live in the database alongside your transcripts, so they survive
+restarts and image upgrades. `WHISPER_INSTANCES` is only read on first start, as
+a convenience for seeding; after that the UI wins.
+
+### Working out the URL
 
 This is where most setups go wrong, so it is worth two minutes.
 
@@ -96,19 +112,16 @@ curl -s http://192.168.1.50:8000/v1/models | head -c 200
 curl -s http://192.168.1.50:9000/openapi.json | grep -o '"/asr"'
 ```
 
-Then build the value. Format is `[name=]url[|kind][|model][|concurrency]`,
-comma-separated:
+Or skip the guesswork: paste the URL into a row and press **Test**. The app
+probes all three APIs and tells you which one answered, then offers that
+server's model list in the Model field.
 
-```
-faster=http://192.168.1.50:8000|openai|Systran/faster-whisper-large-v3|2,asr=http://192.168.1.50:9000|asr_webservice
-```
+Leave **API** on *Auto-detect* unless you have a reason not to. **Parallel** is
+how many requests that instance takes at once: 1 for a CPU container, 2–3 for a
+GPU one with headroom.
 
-You can leave the `kind` off entirely — with `auto`, each instance is probed on
-startup and the Whisper pill in the UI shows what was detected. Naming them is
-optional too, but names make the sidebar and the per-job "via …" line readable.
-
-`concurrency` is how many requests that instance takes at once: 1 for a CPU
-container, 2–3 for a GPU one with headroom.
+**Enabled** lets you park an instance without deleting its settings — useful
+while a container is down or being re-pulled.
 
 ---
 
@@ -182,7 +195,8 @@ field on the container to a tag such as
 | `manifest unknown` / `denied` on pull | The GHCR package is private. The owner makes it public once under the repo's **Packages → protect-transcriber → Package settings → Change visibility**. |
 | Protect pill red, `rejected the credentials` | 2FA is on, or the account is a Ubiquiti SSO login rather than a local one. |
 | Protect pill red, `refused the clip export` | Usually API-key-only auth. Set `PROTECT_USERNAME`/`PROTECT_PASSWORD`. The message lists every endpoint that was tried. |
-| Whisper pill `0/2` | URLs point at `localhost`, or the containers are down. See step 3. |
+| Whisper pill `0/2` | URLs point at `localhost`, or the containers are down. Open **Whisper → Configure** and press **Test** on each row. |
+| Changed `WHISPER_INSTANCES`, nothing happened | Expected — it only seeds on first start. Edit the instances in the UI. |
 | Job fails with `no audio track` | The camera has no mic, or `micVolume` is 0 in Protect. |
 | Job fails with `returned an empty clip` | No footage for that window — it may predate the oldest recording. The timeline shades that region. |
 | Whisper times out on long clips | Lower `CHUNK_SECONDS`, or raise `WHISPER_TIMEOUT`. |

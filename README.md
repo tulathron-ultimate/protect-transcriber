@@ -68,16 +68,17 @@ Click **Save**. Unraid fetches the templates in this repo.
 **Template** dropdown. The form arrives pre-filled: port `8099`, `/data` mapped
 to `/mnt/user/appdata/protect-transcriber`, and every setting described.
 
-Fill in four fields and hit **Apply**:
+Fill in three fields and hit **Apply**:
 
 | Field | Value |
 | --- | --- |
 | `PROTECT_HOST` | your UDM / Cloud Key / NVR IP, e.g. `192.168.1.1` |
 | `PROTECT_USERNAME` | a **local** Protect account (see below) |
 | `PROTECT_PASSWORD` | its password |
-| `WHISPER_INSTANCES` | your Whisper URLs (see below) |
 
-Then click the container's icon → **WebUI**.
+Then click the container's icon → **WebUI** and add your Whisper containers in
+the sidebar under **Whisper → Configure**. Persistent data (clips, transcripts,
+the database) lives in `/mnt/user/appdata/protect-transcriber`.
 
 [docs/unraid-setup.md](docs/unraid-setup.md) walks through the same thing with
 screenshots' worth of detail, plus storage sizing and the container-networking
@@ -119,7 +120,19 @@ An API key (*Settings → Control Plane → Integrations*) works for listing
 cameras and events, but clip export is only reliably available to a session
 login, so configure the local account even if you also set `PROTECT_API_KEY`.
 
-**2. Your Whisper instances.** Comma-separated,
+**2. Your Whisper instances.** Add these in the UI — sidebar **Whisper →
+Configure**. Each row takes a name, URL, API type, model, and how many requests
+that instance handles at once. **Test** probes the URL and tells you which API
+answered (and offers that server's model list); **Save** applies it to the
+running pool immediately, with no container restart.
+
+Instances are stored in the database next to your transcripts, so they survive
+restarts and upgrades.
+
+`WHISPER_INSTANCES` still works as an optional starting point: whatever is set
+there is loaded **once** on first start so it shows up in the UI ready to edit.
+After that the UI is the source of truth and the variable is ignored — otherwise
+a restart would silently undo your changes. Its format is comma-separated
 `[name=]url[|kind][|model][|concurrency]`:
 
 ```bash
@@ -196,6 +209,9 @@ The UI is a client of the same REST API, browsable at `/docs`.
 | `GET` | `/api/cameras` | Cameras with audio capability |
 | `GET` | `/api/cameras/{id}/events` | Event markers for a window |
 | `GET` | `/api/whisper?refresh=true` | Instance health, load, throughput |
+| `GET`/`POST` | `/api/whisper/instances` | List or add a Whisper instance |
+| `PATCH`/`DELETE` | `/api/whisper/instances/{id}` | Edit or remove one |
+| `POST` | `/api/whisper/instances/test` | Probe a URL before saving it |
 | `POST` | `/api/jobs` | Queue a job: `{cameraId, start, end, language?, task?, prompt?}` |
 | `POST` | `/api/jobs/upload` | Queue a job from an uploaded file |
 | `GET` | `/api/jobs` | List jobs with aggregate stats |
@@ -224,7 +240,8 @@ curl -X POST http://localhost:8099/api/jobs \
 | `refused the clip export` | Usually API-key-only auth. Set `PROTECT_USERNAME`/`PROTECT_PASSWORD`. The error lists every endpoint it tried. |
 | `returned an empty clip` | No footage for that window — the range may predate the oldest recording (the timeline shades that part). |
 | `no audio track` | The camera has no mic, or `micVolume` is 0 in Protect. |
-| `No Whisper instance is reachable` | Check the URLs. From inside a container, `localhost` is the container — use the host IP or `host.docker.internal`. |
+| `No Whisper instance is reachable` | Check the URLs under **Whisper → Configure** and hit **Test**. From inside a container, `localhost` is the container — use the host IP or `host.docker.internal`. |
+| Edited `WHISPER_INSTANCES` but nothing changed | Expected: it only seeds the database on first start. Edit instances in the UI instead. |
 | Transcript is empty but the job succeeded | There was genuinely no speech. `WHISPER_VAD_FILTER=true` drops silence. |
 | Whisper times out on long clips | Lower `CHUNK_SECONDS`, or raise `WHISPER_TIMEOUT`. |
 
