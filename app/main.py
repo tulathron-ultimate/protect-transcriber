@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 from fastapi import (
     Depends,
     FastAPI,
@@ -28,10 +29,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import media
+from .analysis import AnalysisClient, AnalysisConfig, AnalysisError, AnalysisNotConfigured
 from .config import BackendKind, Settings, WhisperInstance, get_settings
 from .jobs import JobManager
 from .protect import ProtectAuthError, ProtectClient, ProtectError
-from .store import InstanceStore, JobStore, PreviewStore
+from .store import AnalysisConfigStore, InstanceStore, JobStore, PreviewStore
 from .transcript import Segment, to_srt, to_vtt, to_wallclock_text
 from .whisper import BACKENDS, NoHealthyInstances, OpenAIBackend, WhisperPool
 
@@ -64,6 +66,29 @@ class JobRequest(BaseModel):
     def _aware(cls, value: datetime) -> datetime:
         # Treat a naive timestamp as UTC; the UI always sends an offset.
         return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+class AnalysisSettings(BaseModel):
+    """The LLM endpoint used for summaries, review and Q&A."""
+
+    base_url: str = Field(default="", alias="baseUrl", max_length=500)
+    api_key: str | None = Field(default=None, alias="apiKey")
+    model: str = Field(default="", max_length=200)
+    enabled: bool = False
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("base_url")
+    @classmethod
+    def _needs_scheme(cls, value: str) -> str:
+        value = (value or "").strip().rstrip("/")
+        if value and not value.startswith(("http://", "https://")):
+            raise ValueError("Base URL must start with http:// or https://")
+        return value
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=1000)
 
 
 class PreviewRequest(BaseModel):
@@ -193,6 +218,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await store.init()
 
     previews = PreviewStore(settings.db_path)
+    analysis = AnalysisConfigStore(settings.db_path)
+    # Its own client: the Whisper pool's carries a 30-minute read timeout meant
+    # for transcription, which is far too long to wait on a chat completion.
+    http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=180.0))
     instances = InstanceStore(settings.db_path)
     # First start: lift whatever is in WHISPER_INSTANCES into the database so it
     # shows up in the UI ready to edit. After that the database wins, or a
@@ -221,6 +250,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.store = store
     app.state.instances = instances
     app.state.previews = previews
+    app.state.analysis = analysis
+    app.state.http = http
     app.state.pool = pool
     app.state.protect = protect
     app.state.manager = manager
@@ -244,6 +275,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError):
             await app.state.retention_task
         await manager.stop()
+        await http.aclose()
         await pool.aclose()
         await protect.aclose()
 
@@ -487,6 +519,123 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type="image/jpeg",
             headers={"Cache-Control": "max-age=30"},
         )
+
+    # -- transcript analysis --------------------------------------------------
+
+    def get_analysis_store() -> AnalysisConfigStore:
+        return app.state.analysis
+
+    async def _analysis_client() -> AnalysisClient:
+        row = await app.state.analysis.get()
+        config = AnalysisConfig(
+            base_url=row["base_url"],
+            api_key=row["api_key"],
+            model=row["model"],
+            enabled=bool(row["enabled"]),
+        )
+        if not config.ready:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No analysis endpoint configured. Set one under Analysis in the UI. "
+                    "Note a ChatGPT subscription does not include API access -- OpenAI's "
+                    "API is billed separately, or point this at a local model."
+                ),
+            )
+        return AnalysisClient(config, client=app.state.http)
+
+    async def _segments_for(job_id: str) -> tuple[dict[str, Any], list[Segment]]:
+        job = await app.state.store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="No such job")
+        if job["status"] != "completed":
+            raise HTTPException(status_code=409, detail="That job has no transcript yet")
+        segments = [
+            Segment(start=s.get("start", 0.0), end=s.get("end", 0.0), text=s.get("text", ""))
+            for s in job["segments"]
+        ]
+        if not segments and job["text"]:
+            segments = [Segment(start=0.0, end=0.0, text=job["text"])]
+        return job, segments
+
+    @app.get("/api/analysis", dependencies=[Guard])
+    async def get_analysis(store: AnalysisConfigStore = Depends(get_analysis_store)) -> dict:
+        row = await store.get()
+        config = AnalysisConfig(
+            base_url=row["base_url"], model=row["model"], enabled=bool(row["enabled"])
+        )
+        return {
+            "baseUrl": row["base_url"],
+            "model": row["model"],
+            "enabled": bool(row["enabled"]),
+            "hasApiKey": bool(row["api_key"]),
+            "ready": config.ready,
+        }
+
+    @app.put("/api/analysis", dependencies=[Guard])
+    async def save_analysis(
+        payload: AnalysisSettings, store: AnalysisConfigStore = Depends(get_analysis_store)
+    ) -> dict:
+        fields: dict[str, Any] = {
+            "base_url": payload.base_url,
+            "model": payload.model.strip(),
+            "enabled": int(payload.enabled),
+        }
+        # Omitting the key keeps the stored one; sending "" clears it.
+        if payload.api_key is not None:
+            fields["api_key"] = payload.api_key
+        await store.save(**fields)
+        return await get_analysis(store)
+
+    @app.post("/api/analysis/test", dependencies=[Guard])
+    async def test_analysis(payload: AnalysisSettings) -> dict:
+        stored = await app.state.analysis.get()
+        config = AnalysisConfig(
+            base_url=payload.base_url,
+            # Fall back to the saved key so Test works without retyping it.
+            api_key=payload.api_key if payload.api_key is not None else stored["api_key"],
+            model=payload.model,
+            enabled=True,
+        )
+        if not config.base_url:
+            raise HTTPException(status_code=400, detail="Enter a base URL first")
+        client = AnalysisClient(config, client=app.state.http)
+        try:
+            models = await client.models()
+        except Exception as exc:  # noqa: BLE001 - any transport/HTTP error is just "no"
+            return {"reachable": False, "models": [], "detail": str(exc)[:300]}
+        return {"reachable": True, "models": models[:500]}
+
+    @app.post("/api/jobs/{job_id}/summarize", dependencies=[Guard])
+    async def summarize_job(job_id: str) -> dict:
+        _, segments = await _segments_for(job_id)
+        client = await _analysis_client()
+        try:
+            result = await client.summarize(segments)
+        except (AnalysisError, AnalysisNotConfigured) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        await app.state.store.update(job_id, summary=json.dumps(result))
+        return result
+
+    @app.post("/api/jobs/{job_id}/review", dependencies=[Guard])
+    async def review_job(job_id: str) -> dict:
+        _, segments = await _segments_for(job_id)
+        client = await _analysis_client()
+        try:
+            result = await client.review(segments)
+        except (AnalysisError, AnalysisNotConfigured) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        await app.state.store.update(job_id, review=json.dumps(result))
+        return result
+
+    @app.post("/api/jobs/{job_id}/ask", dependencies=[Guard])
+    async def ask_job(job_id: str, payload: AskRequest) -> dict:
+        _, segments = await _segments_for(job_id)
+        client = await _analysis_client()
+        try:
+            return await client.ask(segments, payload.question.strip())
+        except (AnalysisError, AnalysisNotConfigured) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     # -- previews -----------------------------------------------------------
 
@@ -875,6 +1024,13 @@ def _public_job(job: dict[str, Any], include_segments: bool = False) -> dict[str
     if include_segments:
         payload["text"] = job["text"]
         payload["segments"] = job["segments"]
+        for key in ("summary", "review"):
+            raw = job.get(key)
+            if raw:
+                try:
+                    payload[key] = json.loads(raw)
+                except (TypeError, ValueError):
+                    payload[key] = None
     else:
         payload["preview"] = (job["text"] or "")[:280]
     return payload

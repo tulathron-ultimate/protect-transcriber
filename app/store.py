@@ -53,11 +53,22 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at     TEXT,
     preview_id      TEXT,
     clip_offset     REAL NOT NULL DEFAULT 0,
-    clip_duration   REAL
+    clip_duration   REAL,
+    summary         TEXT,
+    review          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+CREATE TABLE IF NOT EXISTS analysis_config (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    base_url   TEXT NOT NULL DEFAULT '',
+    api_key    TEXT NOT NULL DEFAULT '',
+    model      TEXT NOT NULL DEFAULT '',
+    enabled    INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS previews (
     id           TEXT PRIMARY KEY,
@@ -553,3 +564,51 @@ def _preview_row(row: sqlite3.Row) -> dict[str, Any]:
     except (TypeError, ValueError):
         data["peaks"] = []
     return data
+
+
+class AnalysisConfigStore:
+    """The single LLM endpoint used for summaries, review and Q&A.
+
+    Stored rather than configured through the environment for the same reason as
+    the Whisper instances: changing a model or endpoint should not need a
+    container restart.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = asyncio.Lock()
+
+    def _get_sync(self) -> dict[str, Any]:
+        with _connect(self._path) as conn:
+            row = conn.execute("SELECT * FROM analysis_config WHERE id = 1").fetchone()
+        if row is None:
+            return {
+                "base_url": "",
+                "api_key": "",
+                "model": "",
+                "enabled": 0,
+                "updated_at": "",
+            }
+        return dict(row)
+
+    async def get(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._get_sync)
+
+    def _save_sync(self, fields: dict[str, Any]) -> dict[str, Any]:
+        current = self._get_sync()
+        merged = {**current, **fields}
+        merged.pop("id", None)
+        merged["updated_at"] = _now()
+        with _connect(self._path) as conn:
+            conn.execute(
+                "INSERT INTO analysis_config (id, base_url, api_key, model, enabled, updated_at) "
+                "VALUES (1, :base_url, :api_key, :model, :enabled, :updated_at) "
+                "ON CONFLICT(id) DO UPDATE SET base_url=:base_url, api_key=:api_key, "
+                "model=:model, enabled=:enabled, updated_at=:updated_at",
+                merged,
+            )
+        return self._get_sync()
+
+    async def save(self, **fields: Any) -> dict[str, Any]:
+        async with self._lock:
+            return await asyncio.to_thread(self._save_sync, fields)

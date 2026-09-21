@@ -35,6 +35,12 @@ timeline you can read, search, download, and click through against the video.
 - **Readable output.** Segment list synced to an inline video player, plus
   `.txt`, `.srt`, `.vtt`, `.json`, and a wall-clock log for pasting into an
   incident note.
+- **Preview before you commit.** Export the selected range and watch it inline
+  with an audio waveform, drag to narrow the range, then transcribe — reusing the
+  clip already on disk rather than exporting twice.
+- **Ask an LLM about a transcript.** Summarise it, review it for content worth a
+  look, or ask questions answered only from what was actually said. Points at any
+  OpenAI-compatible chat endpoint — OpenAI's API or a local model.
 - **Full-text search** across every transcript you have made (SQLite FTS5).
 - **Live progress** over server-sent events, with per-chunk counts.
 
@@ -209,6 +215,9 @@ The UI is a client of the same REST API, browsable at `/docs`.
 | `GET` | `/api/cameras` | Cameras with audio capability |
 | `GET` | `/api/cameras/{id}/events` | Event markers for a window |
 | `GET` | `/api/whisper?refresh=true` | Instance health, load, throughput |
+| `POST` | `/api/preview` | Export a range to preview, with waveform peaks |
+| `GET`/`PUT` | `/api/analysis` | The LLM endpoint used for analysis |
+| `POST` | `/api/jobs/{id}/summarize`<br>`/review`<br>`/ask` | Summary, content review, Q&A |
 | `GET`/`POST` | `/api/whisper/instances` | List or add a Whisper instance |
 | `PATCH`/`DELETE` | `/api/whisper/instances/{id}` | Edit or remove one |
 | `POST` | `/api/whisper/instances/test` | Probe a URL before saving it |
@@ -230,6 +239,31 @@ curl -X POST http://localhost:8099/api/jobs \
   -d '{"cameraId":"abc123","start":"2026-09-21T14:00:00Z","end":"2026-09-21T14:05:00Z"}'
 ```
 
+## Transcript analysis
+
+Sidebar → **Analysis → Configure**. Point it at any OpenAI-compatible chat
+endpoint and pick a model; **Test** lists what the server has.
+
+> **A ChatGPT Plus/Pro subscription does not include API access.** OpenAI bills
+> the API separately, so `https://api.openai.com/v1` needs a platform key from
+> <https://platform.openai.com> with its own credits. A local model — Ollama
+> (`http://HOST:11434/v1`), LM Studio, vLLM — costs nothing and keeps recordings
+> of your household off a third party's servers.
+
+Then open any transcript and use:
+
+- **Summarise** — a few sentences plus bullets of what actually happened.
+- **Review for concerns** — flags with a severity, the exact quote and its
+  timestamp (click it to jump the video there). An empty list is the expected
+  answer for ordinary conversation.
+- **Ask** — questions answered only from the transcript, with timestamps cited.
+
+Summaries and reviews are stored on the job, so reopening a transcript does not
+pay for another call. Long transcripts are chunked and map-reduced automatically.
+
+Flags come from an ASR transcript of a noisy environment: mishearings happen, so
+treat them as pointers to audio worth listening to rather than conclusions.
+
 ## Troubleshooting
 
 | Symptom | Cause |
@@ -244,6 +278,8 @@ curl -X POST http://localhost:8099/api/jobs \
 | Edited `WHISPER_INSTANCES` but nothing changed | Expected: it only seeds the database on first start. Edit instances in the UI instead. |
 | Transcript is empty but the job succeeded | There was genuinely no speech. `WHISPER_VAD_FILTER=true` drops silence. |
 | Whisper times out on long clips | Lower `CHUNK_SECONDS`, or raise `WHISPER_TIMEOUT`. |
+| Analysis says it is not configured | Set an endpoint under **Analysis → Configure**. A ChatGPT subscription is not API access. |
+| Analysis returns 401 | The key is wrong, or it is a ChatGPT login rather than a platform API key. |
 
 ## Development
 

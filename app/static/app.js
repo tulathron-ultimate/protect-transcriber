@@ -745,6 +745,14 @@ async function openViewer(jobId) {
 
   renderSegments(job);
   $("viewer-find").value = "";
+  $("ask-input").value = "";
+  $("ask-out").replaceChildren();
+  analysisStatus("");
+  // Results are stored on the job, so a reopened transcript shows them again
+  // without paying for another call.
+  if (job.review) renderReview(job.review);
+  else if (job.summary) renderSummary(job.summary);
+  else $("analysis-out").replaceChildren();
   if (!viewer.open) viewer.showModal();
 }
 
@@ -1284,6 +1292,199 @@ $("instance-add").addEventListener("click", () => {
 instancesDialog.addEventListener("close", () => refreshWhisperStatus());
 
 // --------------------------------------------------------------------------- //
+// transcript analysis (summary / review / ask)
+// --------------------------------------------------------------------------- //
+
+const analysisDialog = $("analysis-dialog");
+
+async function refreshAnalysisState() {
+  try {
+    const config = await api("/api/analysis");
+    const node = $("analysis-state");
+    node.className = `analysis-state ${config.ready ? "ready" : ""}`;
+    node.textContent = config.ready
+      ? `${config.model}`
+      : config.baseUrl
+        ? "configured but disabled"
+        : "Not configured";
+    state.analysisReady = config.ready;
+    return config;
+  } catch {
+    return null;
+  }
+}
+
+async function openAnalysisSettings() {
+  const config = (await refreshAnalysisState()) || {};
+  $("an-url").value = config.baseUrl || "";
+  $("an-model").value = config.model || "";
+  $("an-enabled").checked = Boolean(config.enabled);
+  $("an-key").value = "";
+  $("an-key").placeholder = config.hasApiKey ? "•••••• (unchanged)" : "none";
+  $("an-state").textContent = config.ready ? "ready" : "";
+  $("an-state").className = `instance-state ${config.ready ? "ok" : ""}`;
+  if (!analysisDialog.open) analysisDialog.showModal();
+}
+
+function analysisPayload() {
+  const payload = {
+    baseUrl: $("an-url").value.trim(),
+    model: $("an-model").value.trim(),
+    enabled: $("an-enabled").checked,
+  };
+  // An untouched key box means "keep what is stored".
+  const key = $("an-key").value;
+  if (key) payload.apiKey = key;
+  return payload;
+}
+
+$("open-analysis").addEventListener("click", openAnalysisSettings);
+$("analysis-close").addEventListener("click", () => analysisDialog.close());
+
+$("an-test").addEventListener("click", async () => {
+  const node = $("an-state");
+  node.className = "instance-state busy";
+  node.textContent = "testing…";
+  try {
+    const result = await api("/api/analysis/test", {
+      method: "POST",
+      body: JSON.stringify(analysisPayload()),
+    });
+    if (!result.reachable) {
+      node.className = "instance-state err";
+      node.textContent = result.detail || "unreachable";
+      return;
+    }
+    node.className = "instance-state ok";
+    node.textContent = `reachable · ${result.models.length} model(s)`;
+    const list = $("an-models");
+    list.replaceChildren();
+    for (const model of result.models) {
+      const option = el("option");
+      option.value = model;
+      list.append(option);
+    }
+  } catch (error) {
+    node.className = "instance-state err";
+    node.textContent = error.message;
+  }
+});
+
+$("an-save").addEventListener("click", async () => {
+  try {
+    await api("/api/analysis", { method: "PUT", body: JSON.stringify(analysisPayload()) });
+    toast("Analysis settings saved", "ok");
+    await refreshAnalysisState();
+    analysisDialog.close();
+  } catch (error) {
+    $("an-state").className = "instance-state err";
+    $("an-state").textContent = error.message;
+  }
+});
+
+function analysisStatus(text, kind = "") {
+  const node = $("analysis-status");
+  node.className = `analysis-status ${kind}`;
+  node.textContent = text;
+}
+
+/** Jump the player to a [mm:ss] timestamp the model quoted. */
+function seekToStamp(stamp) {
+  const match = /(\d+):(\d+)/.exec(stamp || "");
+  if (!match || video.hidden || !video.src) return;
+  video.currentTime =
+    Number(match[1]) * 60 + Number(match[2]) + (state.viewerOffset || 0);
+  video.play().catch(() => {});
+}
+
+function renderSummary(result) {
+  const out = $("analysis-out");
+  out.replaceChildren();
+  if (!result.summary && !(result.points || []).length) {
+    out.append(el("p", "muted", "The model returned nothing for this transcript."));
+    return;
+  }
+  out.append(el("h4", null, "Summary"));
+  if (result.summary) out.append(el("p", null, result.summary));
+  if ((result.points || []).length) {
+    const list = el("ul");
+    for (const point of result.points) list.append(el("li", null, point));
+    out.append(list);
+  }
+  if (result.speakers) out.append(el("p", "muted", `Voices: ${result.speakers}`));
+}
+
+function renderReview(result) {
+  const out = $("analysis-out");
+  out.replaceChildren();
+  out.append(el("h4", null, "Review"));
+  if (result.assessment) out.append(el("p", null, result.assessment));
+
+  const flags = result.flags || [];
+  if (!flags.length) {
+    out.append(el("p", "muted", "Nothing flagged."));
+    return;
+  }
+  for (const flag of flags) {
+    const node = el("div", `flag ${flag.severity}`);
+    const head = el("div", "flag-head");
+    head.append(el("span", "sev", flag.severity));
+    head.append(el("span", null, flag.category));
+    if (flag.timestamp) {
+      const stamp = el("time", null, flag.timestamp);
+      stamp.addEventListener("click", () => seekToStamp(flag.timestamp));
+      head.append(stamp);
+    }
+    node.append(head);
+    if (flag.quote) node.append(el("div", "flag-quote", `“${flag.quote}”`));
+    if (flag.reason) node.append(el("div", "flag-why", flag.reason));
+    out.append(node);
+  }
+  out.append(
+    el("p", "muted", "Flags come from an ASR transcript and can be wrong — check the audio.")
+  );
+}
+
+async function runAnalysis(kind) {
+  if (!state.viewerJob) return;
+  const label = kind === "summarize" ? "Summarising" : "Reviewing";
+  analysisStatus(`${label}…`, "busy");
+  for (const id of ["do-summarize", "do-review"]) $(id).disabled = true;
+  try {
+    const result = await api(`/api/jobs/${state.viewerJob}/${kind}`, { method: "POST" });
+    analysisStatus("");
+    if (kind === "summarize") renderSummary(result);
+    else renderReview(result);
+  } catch (error) {
+    analysisStatus(error.message, "err");
+  } finally {
+    for (const id of ["do-summarize", "do-review"]) $(id).disabled = false;
+  }
+}
+
+$("do-summarize").addEventListener("click", () => runAnalysis("summarize"));
+$("do-review").addEventListener("click", () => runAnalysis("review"));
+
+$("ask-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const question = $("ask-input").value.trim();
+  if (!question || !state.viewerJob) return;
+  const out = $("ask-out");
+  out.replaceChildren(el("p", "muted", "Thinking…"));
+  try {
+    const result = await api(`/api/jobs/${state.viewerJob}/ask`, {
+      method: "POST",
+      body: JSON.stringify({ question }),
+    });
+    out.replaceChildren();
+    out.append(el("h4", null, question));
+    out.append(el("p", null, result.answer || "No answer."));
+  } catch (error) {
+    out.replaceChildren(el("p", "muted", error.message));
+  }
+});
+
+// --------------------------------------------------------------------------- //
 // wiring
 // --------------------------------------------------------------------------- //
 
@@ -1361,7 +1562,13 @@ async function init() {
   const now = new Date();
   setRange(new Date(now.getTime() - 15 * 60000), now);
   resizeCanvas();
-  await Promise.all([loadCameras(), loadJobs(), refreshProtectStatus(), refreshWhisperStatus()]);
+  await Promise.all([
+    loadCameras(),
+    loadJobs(),
+    refreshProtectStatus(),
+    refreshWhisperStatus(),
+    refreshAnalysisState(),
+  ]);
   connectStream();
   // Keep the "now" needle and instance load roughly current.
   setInterval(drawTimeline, 30000);
