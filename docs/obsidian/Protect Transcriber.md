@@ -42,14 +42,15 @@ transcript synced to the video.
 
 ## Runbook
 
-```bash
-# Build on the Unraid host (no published image yet)
-cd /mnt/user/appdata/protect-transcriber/src
-git pull && docker build -t protect-transcriber:latest .
+Install via the template repo — no local build:
 
-# Open
-http://TOWER:8099
-```
+1. Docker tab → **Template Repositories** → add
+   `https://github.com/tulathron-ultimate/protect-transcriber` → Save.
+2. Add Container → Template → **protect-transcriber**.
+3. WebUI at `http://TOWER:8099`.
+
+Image: `ghcr.io/tulathron-ultimate/protect-transcriber:latest`, built and pushed
+by `.github/workflows/publish.yml` on every push to `main`.
 
 Key env vars (full list in `.env.example`):
 
@@ -108,6 +109,25 @@ These are the things that cost time to work out.
 - **Pre-resampling to mono 16 kHz PCM** in this service rather than letting each
   container decode saves a step and keeps chunk offsets exact.
 
+### Unraid templates and GHCR
+
+- **Unraid reads template repos natively.** Docker tab → **Template
+  Repositories** → paste a GitHub repo URL. No Community Applications
+  submission or moderation needed. CA's own feed is a separate, curated thing.
+- **Repo layout:** one XML per app (the established convention is a folder per
+  app, or a `templates/`-style dir) plus `ca_profile.xml` at the root, whose
+  root element is `<Maintainer>` with `Icon`/`Profile`/`WebPage`.
+- **Boot-drive fallback** always works and is what the field automates:
+  drop the XML in `/boot/config/plugins/dockerMan/templates-user/`. It then
+  shows up under *User templates* in Add Container.
+- **`TemplateURL`** should point at the raw XML on the default branch so Unraid
+  can refresh it; **`Repository`** must be a pullable image or the template is
+  useless without a local build.
+- **GHCR packages default to private.** The first publish succeeds but Unraid
+  cannot pull anonymously until the package visibility is flipped to public,
+  once, in the repo's Packages settings. Easy to lose an hour to.
+- `GITHUB_TOKEN` needs `permissions: packages: write` in the workflow.
+
 ### Docker on Unraid
 
 - `localhost` inside a container is *that* container. Use the host LAN IP for the
@@ -130,7 +150,8 @@ fails with a 422 about a missing field `_`. Use
   doorbell press, then a notification with the text. `POST /api/jobs` takes
   `{cameraId, start, end}`; poll `GET /api/jobs/{id}` for `completed`.
 - Push finished transcripts into this vault as dated notes.
-- Publish a prebuilt image so Unraid does not need a local `docker build`.
+- Submit to Community Applications proper, so it is searchable in the Apps tab
+  rather than needing the template repo added by hand.
 
 ## Related
 

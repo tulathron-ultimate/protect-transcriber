@@ -1,7 +1,9 @@
 services:
   protect-transcriber:
-    build: .
-    image: protect-transcriber:latest
+    # The published image; nothing to build. Swap `latest` for a version tag to pin.
+    image: ghcr.io/tulathron-ultimate/protect-transcriber:latest
+    # To run your own changes instead, uncomment this and use `docker compose up --build`.
+    # build: .
     container_name: protect-transcriber
     restart: unless-stopped
     ports:

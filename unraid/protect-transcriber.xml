@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>protect-transcriber</Name>
-  <Repository>protect-transcriber:latest</Repository>
-  <Registry/>
+  <Repository>ghcr.io/tulathron-ultimate/protect-transcriber:latest</Repository>
+  <Registry>https://github.com/tulathron-ultimate/protect-transcriber/pkgs/container/protect-transcriber</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
@@ -16,15 +16,16 @@
     across every Whisper container you point it at (faster-whisper-server /
     Speaches, openai-whisper-asr-webservice, or whisper.cpp).
 
-    Build the image on the host first:
-    docker build -t protect-transcriber:latest https://github.com/tulathron-ultimate/protect-transcriber.git
+    Requires a LOCAL UniFi Protect account (Local Access Only, no 2FA) -- that is
+    what drives clip export. Set PROTECT_HOST, PROTECT_USERNAME, PROTECT_PASSWORD
+    and WHISPER_INSTANCES below, then open the WebUI.
 
-    Requires a LOCAL UniFi Protect account without 2FA. See docs/unraid-setup.md.
+    Full setup guide: https://github.com/tulathron-ultimate/protect-transcriber/blob/main/docs/unraid-setup.md
   </Overview>
   <Category>HomeAutomation: Tools:Utilities Productivity:</Category>
   <WebUI>http://[IP]:[PORT:8099]/</WebUI>
-  <TemplateURL/>
-  <Icon/>
+  <TemplateURL>https://raw.githubusercontent.com/tulathron-ultimate/protect-transcriber/main/unraid/protect-transcriber.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/tulathron-ultimate/protect-transcriber/main/unraid/icon.png</Icon>
   <ExtraParams>--add-host=host.docker.internal:host-gateway</ExtraParams>
   <PostArgs/>
   <CPUset/>

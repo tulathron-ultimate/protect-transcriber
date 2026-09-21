@@ -38,20 +38,77 @@ timeline you can read, search, download, and click through against the video.
 - **Full-text search** across every transcript you have made (SQLite FTS5).
 - **Live progress** over server-sent events, with per-chunk counts.
 
-## Quick start
+## Install on Unraid (recommended)
+
+The image is published to GHCR, so there is nothing to build. Add this repo as a
+template source once and the app appears in Unraid's own template list.
+
+### 1. Add the template repository
+
+**Docker** tab → scroll to the bottom → **Template Repositories** → paste:
+
+```
+https://github.com/tulathron-ultimate/protect-transcriber
+```
+
+Click **Save**. Unraid fetches the templates in this repo.
+
+> If your Unraid build has no Template Repositories box, pull the template
+> straight to the boot drive instead — same result, one command over SSH:
+>
+> ```bash
+> mkdir -p /boot/config/plugins/dockerMan/templates-user
+> curl -fsSL -o /boot/config/plugins/dockerMan/templates-user/my-protect-transcriber.xml \
+>   https://raw.githubusercontent.com/tulathron-ultimate/protect-transcriber/main/unraid/protect-transcriber.xml
+> ```
+
+### 2. Add the container
+
+**Docker** tab → **Add Container** → pick **protect-transcriber** from the
+**Template** dropdown. The form arrives pre-filled: port `8099`, `/data` mapped
+to `/mnt/user/appdata/protect-transcriber`, and every setting described.
+
+Fill in four fields and hit **Apply**:
+
+| Field | Value |
+| --- | --- |
+| `PROTECT_HOST` | your UDM / Cloud Key / NVR IP, e.g. `192.168.1.1` |
+| `PROTECT_USERNAME` | a **local** Protect account (see below) |
+| `PROTECT_PASSWORD` | its password |
+| `WHISPER_INSTANCES` | your Whisper URLs (see below) |
+
+Then click the container's icon → **WebUI**.
+
+[docs/unraid-setup.md](docs/unraid-setup.md) walks through the same thing with
+screenshots' worth of detail, plus storage sizing and the container-networking
+trap that catches most people.
+
+### Other platforms
 
 ```bash
 git clone https://github.com/tulathron-ultimate/protect-transcriber.git
 cd protect-transcriber
 cp .env.example .env
-$EDITOR .env          # Protect host + local account, and your Whisper URLs
+$EDITOR .env
 docker compose up -d
 ```
 
-Then open <http://localhost:8099>. The two pills in the header tell you whether
+Or run the published image directly:
+
+```bash
+docker run -d --name protect-transcriber -p 8099:8099 \
+  -v /path/to/appdata:/data \
+  -e PROTECT_HOST=192.168.1.1 \
+  -e PROTECT_USERNAME=transcriber \
+  -e PROTECT_PASSWORD=... \
+  -e 'WHISPER_INSTANCES=faster=http://192.168.1.50:8000|openai,asr=http://192.168.1.50:9000|asr_webservice' \
+  ghcr.io/tulathron-ultimate/protect-transcriber:latest
+```
+
+Either way, open <http://HOST:8099>. The two pills in the header tell you whether
 Protect and the Whisper pool are actually reachable; click either to re-probe.
 
-### The two things you must set
+## The two things you must set
 
 **1. A local Protect account.** In the UniFi console: *Settings → Admins &
 Users → Add Admin*, choose **Local Access Only**, and give it View access to the
@@ -80,10 +137,11 @@ WHISPER_INSTANCES=faster=http://192.168.1.50:8000|openai|Systran/faster-whisper-
 for a CPU container, raise it for a GPU one with headroom. `model` only matters
 for the OpenAI-shaped API, which requires a model name in the request.
 
-See [docs/unraid-setup.md](docs/unraid-setup.md) for the Unraid-specific path
-(Community Applications template, appdata paths, talking to containers on the
-same host) and [docs/architecture.md](docs/architecture.md) for how the pipeline
-fits together.
+> **Do not use `localhost`.** Inside a container that means the container
+> itself, not your Unraid host. Use the host's LAN IP.
+
+See [docs/architecture.md](docs/architecture.md) for how the pipeline fits
+together.
 
 ## Using it
 
@@ -160,6 +218,8 @@ curl -X POST http://localhost:8099/api/jobs \
 
 | Symptom | Cause |
 | --- | --- |
+| `manifest unknown` / `denied` when pulling | The GHCR package is private. Make it public once: repo **Packages → protect-transcriber → Package settings → Change visibility**. |
+| Template missing from Unraid's dropdown | The repository was not saved, or the fetch failed. Use the `curl` fallback in [docs/unraid-setup.md](docs/unraid-setup.md). |
 | `rejected the credentials` | 2FA on the account, or it is a Ubiquiti SSO login rather than a local one. |
 | `refused the clip export` | Usually API-key-only auth. Set `PROTECT_USERNAME`/`PROTECT_PASSWORD`. The error lists every endpoint it tried. |
 | `returned an empty clip` | No footage for that window — the range may predate the oldest recording (the timeline shades that part). |
