@@ -235,8 +235,45 @@ async def test_pool_retries_a_failed_chunk_on_another_instance(audio):
     by_name = {state.instance.name: state for state in pool.states}
     assert by_name["b"].completed == 1
     assert by_name["a"].completed == 0
+    # The retry must move off the instance that just failed rather than hammer it,
+    # so the broken one is hit at most once however the first pick fell.
+    assert by_name["a"].failed <= 1
     if bad.called:
         assert by_name["a"].failed == 1, "a failure must be recorded against the instance"
+    await pool.aclose()
+
+
+@respx.mock
+async def test_retries_skip_every_instance_that_already_failed_this_chunk(audio):
+    """With three instances and three attempts, each failure must move on."""
+    for host in ("a", "b", "c"):
+        respx.get(f"http://{host}:8000/v1/models").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "m"}]})
+        )
+    respx.post("http://a:8000/v1/audio/transcriptions").mock(
+        return_value=httpx.Response(500, text="CUDA out of memory")
+    )
+    respx.post("http://b:8000/v1/audio/transcriptions").mock(
+        return_value=httpx.Response(500, text="CUDA out of memory")
+    )
+    respx.post("http://c:8000/v1/audio/transcriptions").mock(
+        return_value=httpx.Response(200, json=VERBOSE_JSON)
+    )
+    pool = WhisperPool(
+        _settings(
+            "a=http://a:8000|openai, b=http://b:8000|openai, c=http://c:8000|openai",
+            whisper_max_attempts=3,
+        )
+    )
+    result = await pool.transcribe_file(audio, audio_seconds=4.2)
+
+    # Whatever order the two broken instances come up in, the healthy one is
+    # reached within the attempt budget because no instance is tried twice.
+    assert result.instance == "c"
+    by_name = {state.instance.name: state for state in pool.states}
+    assert by_name["c"].completed == 1
+    assert by_name["a"].failed <= 1
+    assert by_name["b"].failed <= 1
     await pool.aclose()
 
 

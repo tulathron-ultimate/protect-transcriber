@@ -417,11 +417,21 @@ class WhisperPool:
             )
         log.warning("Whisper instance %s is unhealthy: %s", state.instance.name, state.detail)
 
-    def _pick(self) -> InstanceState | None:
-        """Least-loaded healthy instance, preferring the faster ones on a tie."""
-        available = [s for s in self.states if s.healthy and s.in_flight < s.instance.concurrency]
-        if not available:
-            available = [s for s in self.states if s.healthy]
+    def _pick(self, exclude: set[str] | None = None) -> InstanceState | None:
+        """Least-loaded healthy instance, preferring the faster ones on a tie.
+
+        ``exclude`` names instances that already failed this piece of audio. They
+        are skipped while any other healthy instance exists, so a retry moves to a
+        different container instead of hammering the one that just failed. When
+        every healthy instance has failed -- including a single-instance pool --
+        the exclusion is dropped so the remaining attempts still happen.
+        """
+        healthy = [s for s in self.states if s.healthy]
+        untried = [s for s in healthy if s.instance.name not in (exclude or ())]
+        candidates = untried or healthy
+        # Prefer one with a free slot, but fall back to queueing on the semaphore.
+        free = [s for s in candidates if s.in_flight < s.instance.concurrency]
+        available = free or candidates
         if not available:
             return None
         return min(
@@ -458,7 +468,7 @@ class WhisperPool:
         last_error: Exception | None = None
 
         for attempt in range(attempts):
-            state = self._pick()
+            state = self._pick(exclude=set(tried))
             if state is None or state.backend is None:
                 break
             async with state.semaphore:
