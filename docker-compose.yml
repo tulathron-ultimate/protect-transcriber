@@ -1,0 +1,17 @@
+services:
+  protect-transcriber:
+    build: .
+    image: protect-transcriber:latest
+    container_name: protect-transcriber
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    env_file:
+      - .env
+    volumes:
+      # On Unraid this is typically /mnt/user/appdata/protect-transcriber
+      - ./data:/data
+    # Whisper containers are usually on the same host; if they are on this
+    # Docker network instead, reference them by service name in WHISPER_INSTANCES.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

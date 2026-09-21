@@ -1,0 +1,95 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>protect-transcriber</Name>
+  <Repository>protect-transcriber:latest</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/tulathron-ultimate/protect-transcriber/issues</Support>
+  <Project>https://github.com/tulathron-ultimate/protect-transcriber</Project>
+  <Overview>
+    Select a camera and a time range from your UniFi Protect recordings and get a
+    transcript back from self-hosted Whisper instances. Exports the clip from the
+    NVR, extracts the audio with ffmpeg, splits it on silence, and fans the chunks
+    across every Whisper container you point it at (faster-whisper-server /
+    Speaches, openai-whisper-asr-webservice, or whisper.cpp).
+
+    Build the image on the host first:
+    docker build -t protect-transcriber:latest https://github.com/tulathron-ultimate/protect-transcriber.git
+
+    Requires a LOCAL UniFi Protect account without 2FA. See docs/unraid-setup.md.
+  </Overview>
+  <Category>HomeAutomation: Tools:Utilities Productivity:</Category>
+  <WebUI>http://[IP]:[PORT:8099]/</WebUI>
+  <TemplateURL/>
+  <Icon/>
+  <ExtraParams>--add-host=host.docker.internal:host-gateway</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+
+  <Config Name="WebUI Port" Target="8099" Default="8099" Mode="tcp"
+          Description="Port for the web UI and API." Type="Port" Display="always"
+          Required="true" Mask="false">8099</Config>
+
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/protect-transcriber"
+          Mode="rw" Description="Clips, extracted audio, transcripts and the job database."
+          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/protect-transcriber</Config>
+
+  <Config Name="Protect Host" Target="PROTECT_HOST" Default="" Mode=""
+          Description="IP or hostname of the UDM / Cloud Key / NVR. No scheme."
+          Type="Variable" Display="always" Required="true" Mask="false"/>
+
+  <Config Name="Protect Username" Target="PROTECT_USERNAME" Default="" Mode=""
+          Description="A LOCAL Protect admin account (Local Access Only, no 2FA)."
+          Type="Variable" Display="always" Required="true" Mask="false"/>
+
+  <Config Name="Protect Password" Target="PROTECT_PASSWORD" Default="" Mode=""
+          Description="Password for that local account."
+          Type="Variable" Display="always" Required="true" Mask="true"/>
+
+  <Config Name="Whisper Instances" Target="WHISPER_INSTANCES" Default="" Mode=""
+          Description="Comma separated: [name=]url[|kind][|model][|concurrency]. kind is auto, openai, asr_webservice or whisper_cpp. Example: faster=http://192.168.1.50:8000|openai|Systran/faster-whisper-large-v3|2,asr=http://192.168.1.50:9000|asr_webservice"
+          Type="Variable" Display="always" Required="true" Mask="false"/>
+
+  <Config Name="Protect API Key" Target="PROTECT_API_KEY" Default="" Mode=""
+          Description="Optional. Used for the newer integration endpoints. Clip export still prefers the local account."
+          Type="Variable" Display="advanced" Required="false" Mask="true"/>
+
+  <Config Name="Verify SSL" Target="PROTECT_VERIFY_SSL" Default="false" Mode=""
+          Description="UniFi uses a self-signed certificate, so this is normally false."
+          Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+
+  <Config Name="App Token" Target="APP_TOKEN" Default="" Mode=""
+          Description="Optional shared secret. If set, open the UI as http://host:8099/?token=VALUE."
+          Type="Variable" Display="advanced" Required="false" Mask="true"/>
+
+  <Config Name="Language" Target="WHISPER_LANGUAGE" Default="" Mode=""
+          Description="Leave blank to auto-detect, or set a code such as en."
+          Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="Chunk Seconds" Target="CHUNK_SECONDS" Default="300" Mode=""
+          Description="Audio per Whisper request. Lower this if a container times out."
+          Type="Variable" Display="advanced" Required="false" Mask="false">300</Config>
+
+  <Config Name="Max Range Seconds" Target="MAX_RANGE_SECONDS" Default="14400" Mode=""
+          Description="Largest selectable window. Default 4 hours."
+          Type="Variable" Display="advanced" Required="false" Mask="false">14400</Config>
+
+  <Config Name="Keep Clips" Target="KEEP_CLIPS" Default="true" Mode=""
+          Description="Keep the exported mp4 so the UI can play it back beside the transcript."
+          Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <Config Name="Retention Days" Target="RETENTION_DAYS" Default="30" Mode=""
+          Description="Delete finished jobs and their files after this many days. 0 disables."
+          Type="Variable" Display="advanced" Required="false" Mask="false">30</Config>
+
+  <Config Name="Log Level" Target="LOG_LEVEL" Default="INFO" Mode=""
+          Description="DEBUG, INFO, WARNING or ERROR."
+          Type="Variable" Display="advanced" Required="false" Mask="false">INFO</Config>
+</Container>
