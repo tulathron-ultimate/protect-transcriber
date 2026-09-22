@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="unraid/icon.png" alt="" width="112" height="112" />
+</p>
+
 # protect-transcriber
 
 Pick a camera and a time range from your UniFi Protect recordings, and get a
