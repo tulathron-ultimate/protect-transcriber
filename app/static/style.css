@@ -53,7 +53,13 @@ button { font: inherit; cursor: pointer; }
 }
 
 .brand { display: flex; align-items: center; gap: 12px; }
-.logo { font-size: 26px; line-height: 1; }
+.logo {
+  width: 40px;
+  height: 40px;
+  display: block;
+  border-radius: 10px;
+  flex: none;
+}
 .tagline { margin: 2px 0 0; color: var(--text-faint); font-size: 12px; }
 
 .status-pills { display: flex; gap: 8px; flex-wrap: wrap; }

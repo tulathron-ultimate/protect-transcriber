@@ -128,6 +128,24 @@ def test_repo_relative_urls_point_at_files_that_exist(template: ET.Element):
         assert (REPO / relative).exists(), f"{relative} is referenced but missing from the repo"
 
 
+def test_icon_assets_are_valid_and_square(template: ET.Element):
+    """The template and the web UI both reference these, so a corrupt commit is
+    invisible until someone installs the container."""
+    import struct
+    import xml.etree.ElementTree as ElementTree
+
+    png = (REPO / "unraid" / "icon.png").read_bytes()
+    assert png[:8] == b"\x89PNG\r\n\x1a\n", "icon.png is not a PNG"
+    width, height = struct.unpack(">II", png[16:24])
+    assert (width, height) == (256, 256)
+
+    # The SVG is the source art, and the UI serves it as the favicon.
+    for path in (REPO / "unraid" / "icon.svg", REPO / "app" / "static" / "icon.svg"):
+        root = ElementTree.parse(path).getroot()
+        assert root.tag.endswith("svg")
+        assert root.get("viewBox") == "0 0 256 256"
+
+
 def test_template_url_points_at_this_template(template: ET.Element):
     assert template.findtext("TemplateURL", "").endswith("unraid/protect-transcriber.xml")
 

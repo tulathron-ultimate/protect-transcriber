@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"
+     role="img" aria-labelledby="pt-title pt-desc">
+  <title id="pt-title">protect-transcriber</title>
+  <desc id="pt-desc">A camera lens with a sound waveform inside it, above two lines of
+    transcribed text: the camera hears, and the words come back.</desc>
+
+  <defs>
+    <linearGradient id="pt-tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d222c"/>
+      <stop offset="1" stop-color="#0b0e13"/>
+    </linearGradient>
+    <!-- Off-centre so the glass reads as convex, lit from the upper left. -->
+    <radialGradient id="pt-iris" cx="0.38" cy="0.32" r="0.78">
+      <stop offset="0" stop-color="#2b4066"/>
+      <stop offset="1" stop-color="#0d131c"/>
+    </radialGradient>
+    <linearGradient id="pt-wave" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9cc4ff"/>
+      <stop offset="1" stop-color="#5b9bfd"/>
+    </linearGradient>
+    <clipPath id="pt-glass"><circle cx="128" cy="96" r="56"/></clipPath>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="url(#pt-tile)"/>
+
+  <!-- lens barrel -->
+  <circle cx="128" cy="96" r="68" fill="none" stroke="#263143" stroke-width="6"/>
+
+  <!-- glass -->
+  <circle cx="128" cy="96" r="56" fill="url(#pt-iris)"/>
+  <!-- aperture blades: visible on a big tile, dissolve gracefully at 32px -->
+  <g clip-path="url(#pt-glass)" fill="none" stroke="#33496b" stroke-width="4" opacity="0.9">
+    <path d="M128 38 L178 67 L178 125 L128 154 L78 125 L78 67 Z"/>
+  </g>
+  <circle cx="128" cy="96" r="56" fill="none" stroke="#3d8bfd" stroke-width="9"/>
+  <!-- catchlight on the glass -->
+  <path d="M96 60 A 44 44 0 0 0 82 98" fill="none" stroke="#e4edfb" stroke-width="7"
+        stroke-linecap="round" opacity="0.45"/>
+
+  <!-- what it hears -->
+  <g fill="url(#pt-wave)">
+    <rect x="99"  y="80" width="11" height="32" rx="5.5"/>
+    <rect x="117" y="66" width="11" height="60" rx="5.5"/>
+    <rect x="135" y="58" width="11" height="76" rx="5.5"/>
+    <rect x="153" y="76" width="11" height="40" rx="5.5"/>
+  </g>
+
+  <!-- what it writes down: broken into words, and the last line runs short -->
+  <g>
+    <rect x="60"  y="188" width="94" height="15" rx="7.5" fill="#9aa4b2"/>
+    <rect x="164" y="188" width="32" height="15" rx="7.5" fill="#9aa4b2"/>
+    <rect x="60"  y="212" width="66" height="15" rx="7.5" fill="#37d399"/>
+  </g>
+</svg>
