@@ -115,6 +115,45 @@ CREATE VIRTUAL TABLE IF NOT EXISTS job_search USING fts5(
 """
 
 
+# Columns added to an existing table after the first release.
+#
+# `CREATE TABLE IF NOT EXISTS` does nothing to a table that is already there, so
+# a database created by an older version never gains new columns on its own --
+# it just starts failing with "table jobs has no column named ...". Every column
+# added to a pre-existing table must therefore be listed here as well as in
+# _SCHEMA, so upgrades pick it up.
+#
+# Append only: never reorder or remove an entry, and give any NOT NULL column a
+# DEFAULT, because SQLite requires one when adding to a populated table.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    # (table, column, definition)
+    ("jobs", "preview_id", "TEXT"),
+    ("jobs", "clip_offset", "REAL NOT NULL DEFAULT 0"),
+    ("jobs", "clip_duration", "REAL"),
+    ("jobs", "summary", "TEXT"),
+    ("jobs", "review", "TEXT"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> list[str]:
+    """Add any columns an older database is missing. Returns what was added."""
+    added: list[str] = []
+    wanted: dict[str, list[tuple[str, str]]] = {}
+    for table, column, definition in _ADDED_COLUMNS:
+        wanted.setdefault(table, []).append((column, definition))
+
+    for table, columns in wanted.items():
+        # Table names come from the constant above, never from user input.
+        present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not present:
+            continue  # a fresh database: _SCHEMA already created it in full
+        for column, definition in columns:
+            if column not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                added.append(f"{table}.{column}")
+    return added
+
+
 @dataclass(slots=True)
 class JobRecord:
     data: dict[str, Any]
@@ -168,6 +207,9 @@ class JobStore:
     def _init_sync(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            added = _migrate(conn)
+            if added:
+                log.info("Upgraded the database schema: added %s", ", ".join(added))
             # A job left mid-flight by a container restart can never finish.
             conn.execute(
                 "UPDATE jobs SET status='failed', stage='', "
